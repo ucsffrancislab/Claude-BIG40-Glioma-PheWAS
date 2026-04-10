@@ -33,7 +33,7 @@ IDP_FIRST=1
 IDP_LAST=3935
 
 DATA_DIR="${1:-data/big40}"
-STATS_DIR="${DATA_DIR}/stats_22k"
+STATS_DIR="${DATA_DIR}/stats22k"
 LOG_FILE="${DATA_DIR}/download_ebi.log"
 
 # ── Helper functions ─────────────────────────────────────────────────────────
@@ -69,6 +69,17 @@ safe_download() {
     fi
 }
 
+# ebi_bucket <accession_number>
+#   Returns the EBI bucket directory name for a given accession number.
+#   EBI groups accessions in ranges of 1000:
+#     GCST90002001-GCST90003000, GCST90003001-GCST90004000, etc.
+ebi_bucket() {
+    local acc_num=$1
+    local bucket_start=$(( ((acc_num - 1) / 1000) * 1000 + 1 ))
+    local bucket_end=$(( bucket_start + 999 ))
+    echo "GCST${bucket_start}-GCST${bucket_end}"
+}
+
 # ── Setup ────────────────────────────────────────────────────────────────────
 
 mkdir -p "$STATS_DIR"
@@ -76,10 +87,12 @@ log "EBI download session started.  DATA_DIR=${DATA_DIR}"
 
 # ── Download ─────────────────────────────────────────────────────────────────
 #
-# EBI GWAS Catalog directory structure per accession:
-#   GCSTXXXXXXXX/
-#     harmonised/
-#       GCSTXXXXXXXX.h.tsv.gz    (harmonised summary stats)
+# EBI GWAS Catalog FTP directory structure:
+#   summary_statistics/
+#     GCST90002001-GCST90003000/       <-- bucket (groups of 1000)
+#       GCST90002426/                  <-- accession directory
+#         harmonised/
+#           GCST90002426.h.tsv.gz      <-- harmonised summary stats
 #
 # We download the harmonised file and rename it to {IDP}.h.tsv.gz for clarity.
 
@@ -98,7 +111,9 @@ failed=0
 for (( n=IDP_FIRST; n<=IDP_LAST; n++ )); do
     i=$((i + 1))
     idp=$(printf "%04d" "$n")
-    accession=$(printf "GCST%08d" $(( ACCESSION_OFFSET + n )))
+    acc_num=$(( ACCESSION_OFFSET + n ))
+    accession="GCST${acc_num}"
+    bucket=$(ebi_bucket "$acc_num")
     outfile="${STATS_DIR}/${idp}.h.tsv.gz"
 
     # Already complete
@@ -111,7 +126,7 @@ for (( n=IDP_FIRST; n<=IDP_LAST; n++ )); do
     printf "\r  [%4d / %d]  IDP %s (%s)  downloading ...          " \
         "$i" "$total" "$idp" "$accession"
 
-    url="${EBI_BASE}/${accession}/harmonised/${accession}.h.tsv.gz"
+    url="${EBI_BASE}/${bucket}/${accession}/harmonised/${accession}.h.tsv.gz"
 
     if safe_download "$url" "$outfile"; then
         downloaded=$((downloaded + 1))
@@ -142,7 +157,7 @@ echo "============================================================"
 log "Total IDPs  : ${total}"
 log "Downloaded  : ${downloaded}  (this run)"
 log "Skipped     : ${skipped}  (already complete)"
-log "Not found   : ${not_found}  (accession may not exist)"
+log "Not found   : ${not_found}  (accession may not exist or different path)"
 log "Failed      : ${failed}  (network errors — rerun to retry)"
 echo ""
 

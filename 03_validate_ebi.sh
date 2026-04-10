@@ -85,7 +85,7 @@ for f in "${STATS_DIR}"/*.tsv.gz; do
     fi
 
     # 2. Column headers
-    header=$(zcat "$f" | head -1)
+    header=$(zcat "$f" | head -1 || true)
 
     if [ "$ftype" = "harmonised" ]; then
         missing_cols=""
@@ -115,7 +115,7 @@ for f in "${STATS_DIR}"/*.tsv.gz; do
 
     # 3. Row count (sample first 10M lines, extrapolate if needed)
     #    BIG40 GWAS has ~10-17M SNPs.  Flag if < 1M or > 25M.
-    rowcount=$(zcat "$f" | wc -l)
+    rowcount=$(zcat "$f" | wc -l || true)
     rowcount=$((rowcount - 1))  # subtract header
 
     if [ "$rowcount" -lt 1000000 ]; then
@@ -127,7 +127,7 @@ for f in "${STATS_DIR}"/*.tsv.gz; do
     fi
 
     # 4. Numeric spot-check: grab line 1000, check that beta-like column is numeric
-    spot=$(zcat "$f" | sed -n '1000p')
+    spot=$(zcat "$f" | sed -n '1000p' || true)
     if [ -n "$spot" ]; then
         # Try to extract a field that should be numeric (beta or similar)
         # Use the header to find the beta column index
@@ -181,12 +181,12 @@ sample_h=$(find "$STATS_DIR" -name '*.h.tsv.gz' | head -1)
 if [ -n "$sample_h" ]; then
     log ""
     log "  Harmonised ($(basename "$sample_h")):"
-    log "  $(zcat "$sample_h" | head -1 | tr '\t' '\n' | cat -n)"
+    log "  $(zcat "$sample_h" | head -1 | tr '\t' '\n' | cat -n || true)"
 fi
 
 sample_raw=$(find "$STATS_DIR" -name '*.raw_hg19.tsv.gz' | head -1)
 if [ -n "$sample_raw" ]; then
     log ""
     log "  Raw hg19 ($(basename "$sample_raw")):"
-    log "  $(zcat "$sample_raw" | head -1 | tr '\t' '\n' | cat -n)"
+    log "  $(zcat "$sample_raw" | head -1 | tr '\t' '\n' | cat -n || true)"
 fi

@@ -12,9 +12,10 @@
 #   - Rerun this script as many times as needed after network interruptions.
 #
 # Usage:
-#   bash 01_download_big40.sh [DATA_DIR]
+#   bash 01_download_big40.sh [DATA_DIR] [NJOBS]
 #
-#   DATA_DIR  Base directory for all downloads (default: data/big40)
+#   DATA_DIR  Base directory for all downloads  (default: data/big40)
+#   NJOBS     Parallel download workers         (default: 8)
 #
 # Estimated sizes:
 #   GWAS summary stats  ~40 GB compressed  (~1.4 TB uncompressed)
@@ -34,11 +35,11 @@ STATS_URL="https://open.win.ox.ac.uk/ukbiobank/big40/release2/stats33k"
 VARIANT_URL="https://open.oxcin.ox.ac.uk/ukbiobank/big40/release2/variants.txt.gz"
 
 DATA_DIR="${1:-data/big40}"
+NJOBS="${2:-8}"
 STATS_DIR="${DATA_DIR}/stats33k"
 LOG_FILE="${DATA_DIR}/download.log"
 
 # IDP files are 4-digit zero-padded: 0001.txt.gz .. 3935.txt.gz
-# Some numbers in this range may not exist on the server (gaps) — that's normal.
 IDP_FIRST=1
 IDP_LAST=3935
 
@@ -56,7 +57,6 @@ safe_download() {
     local url="$1"
     local out="$2"
 
-    # Write-protected = already complete
     if [[ -f "$out" && ! -w "$out" ]]; then
         return 0
     fi
@@ -80,7 +80,7 @@ safe_download() {
 # ── Setup ────────────────────────────────────────────────────────────────────
 
 mkdir -p "$STATS_DIR"
-log "Download session started.  DATA_DIR=${DATA_DIR}"
+log "Download session started.  DATA_DIR=${DATA_DIR}  NJOBS=${NJOBS}"
 
 # ── Phase 1: Variant annotation ─────────────────────────────────────────────
 
@@ -95,7 +95,6 @@ if [[ -f "$VARIANT_FILE" && ! -w "$VARIANT_FILE" ]]; then
     log "variants.txt.gz already complete (write-protected)."
 else
     log "Downloading variants.txt.gz (~270 MB) ..."
-    log "  URL: ${VARIANT_URL}"
     if safe_download "$VARIANT_URL" "$VARIANT_FILE"; then
         log "  OK   variants.txt.gz  ($(du -h "$VARIANT_FILE" | cut -f1))"
     else
@@ -103,71 +102,79 @@ else
     fi
 fi
 
-# ── Phase 2: GWAS summary statistics ────────────────────────────────────────
+# ── Phase 2: GWAS summary statistics (parallel) ─────────────────────────────
 
 echo ""
 echo "============================================================"
-echo "  Phase 2 / 2 :  GWAS summary statistics  (${IDP_FIRST}..${IDP_LAST})"
+echo "  Phase 2 / 2 :  GWAS summary statistics  (${NJOBS} workers)"
 echo "============================================================"
 
 total=$(( IDP_LAST - IDP_FIRST + 1 ))
-i=0
-downloaded=0
-skipped=0
-not_found=0
-failed=0
+log "Downloading ${total} IDP files with ${NJOBS} parallel workers ..."
 
-for (( n=IDP_FIRST; n<=IDP_LAST; n++ )); do
-    i=$((i + 1))
-    idp=$(printf "%04d" "$n")
-    outfile="${STATS_DIR}/${idp}.txt.gz"
+# Write a small worker script that xargs will call.
+# Each invocation handles one IDP number.
+WORKER=$(mktemp)
+cat > "$WORKER" <<'WORKER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+idp="$1"
+stats_url="$2"
+stats_dir="$3"
+log_file="$4"
 
-    # Already complete
-    if [[ -f "$outfile" && ! -w "$outfile" ]]; then
-        skipped=$((skipped + 1))
-        printf "\r  [%4d / %d]  IDP %s  SKIP" "$i" "$total" "$idp"
-        continue
-    fi
+outfile="${stats_dir}/${idp}.txt.gz"
 
-    printf "\r  [%4d / %d]  IDP %s  downloading ...          " "$i" "$total" "$idp"
+# Write-protected = already complete
+if [[ -f "$outfile" && ! -w "$outfile" ]]; then
+    echo "SKIP  ${idp}"
+    exit 0
+fi
 
-    if safe_download "${STATS_URL}/${idp}.txt.gz" "$outfile"; then
-        downloaded=$((downloaded + 1))
-        printf "\r  [%4d / %d]  IDP %s  OK   (%s)              \n" \
-            "$i" "$total" "$idp" "$(du -h "$outfile" | cut -f1)"
+if curl -fSL \
+        --retry 3 \
+        --retry-delay 10 \
+        --connect-timeout 30 \
+        --max-time 3600 \
+        -o "$outfile" \
+        "${stats_url}/${idp}.txt.gz" 2>>"$log_file"; then
+    chmod a-w "$outfile"
+    echo "OK    ${idp}  $(du -h "$outfile" | cut -f1)"
+else
+    rc=$?
+    rm -f "$outfile"
+    if [[ $rc -eq 22 ]]; then
+        echo "404   ${idp}"
     else
-        rc=$?
-        if [[ $rc -eq 22 ]]; then
-            not_found=$((not_found + 1))
-            printf "\r  [%4d / %d]  IDP %s  NOT FOUND (gap)       \n" \
-                "$i" "$total" "$idp"
-        else
-            failed=$((failed + 1))
-            printf "\r  [%4d / %d]  IDP %s  FAIL (curl rc=%d)     \n" \
-                "$i" "$total" "$idp" "$rc"
-        fi
+        echo "FAIL  ${idp}"
     fi
-done
+fi
+WORKER_EOF
+chmod +x "$WORKER"
 
-echo ""
+# Generate 4-digit zero-padded IDP numbers, pipe to xargs for parallel exec
+seq -f "%04g" "$IDP_FIRST" "$IDP_LAST" \
+    | xargs -P "$NJOBS" -I {} \
+        bash "$WORKER" {} "$STATS_URL" "$STATS_DIR" "$LOG_FILE"
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+rm -f "$WORKER"
+
+# ── Summary (count results from filesystem) ──────────────────────────────────
 
 echo ""
 echo "============================================================"
 echo "  Download Summary"
 echo "============================================================"
-log "Total IDPs  : ${total}"
-log "Downloaded  : ${downloaded}  (this run)"
-log "Skipped     : ${skipped}  (already complete)"
-log "Not found   : ${not_found}  (gaps in IDP numbering)"
-log "Failed      : ${failed}  (network errors — rerun to retry)"
+
+# Count write-protected files in stats_dir = successfully downloaded
+completed=$(find "$STATS_DIR" -name '*.txt.gz' ! -writable 2>/dev/null | wc -l)
+
+log "Total IDPs requested : ${total}"
+log "Files complete        : ${completed}  (write-protected in ${STATS_DIR})"
+log "Remaining             : $(( total - completed ))"
 echo ""
 
-if [[ "$failed" -gt 0 ]]; then
-    log "Some downloads failed due to network errors. Rerun this script to retry."
-    exit 1
-else
-    log "All downloads complete."
-    exit 0
+if [[ "$completed" -lt "$total" ]]; then
+    log "Some files still missing (gaps in IDP numbering are normal)."
+    log "Rerun to retry any network failures."
 fi

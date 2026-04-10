@@ -9,8 +9,9 @@
 # EBI accessions: GCST90002426 through GCST90006360
 # Source: Smith et al. (2021) Nature Neuroscience 24(5):737-745
 #
-# The EBI FTP is a proper data server and should be much faster than the
-# Oxford BIG40 web server used for stats33k.
+# Most accessions have harmonised files (~900 MB gzipped).  A small number
+# (~4%) only have the raw TSV (~1.3 GB uncompressed); for those the script
+# falls back to downloading the raw file and gzipping it locally.
 #
 # Crash-safe: same write-protection pattern as 01_download_big40.sh.
 #
@@ -45,8 +46,6 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] EBI download session started.  DATA_DIR=${D
     | tee -a "$LOG_FILE"
 
 # ── Worker script ────────────────────────────────────────────────────────────
-#
-# Each worker handles one IDP.  Written to a temp file so xargs can call it.
 
 WORKER=$(mktemp)
 cat > "$WORKER" << 'WORKER_EOF'
@@ -68,34 +67,59 @@ bucket_start=$(( ((acc_num - 1) / 1000) * 1000 + 1 ))
 bucket_end=$(( bucket_start + 999 ))
 bucket="GCST${bucket_start}-GCST${bucket_end}"
 
-outfile="${stats_dir}/${idp}.h.tsv.gz"
+acc_dir="${ebi_base}/${bucket}/${accession}"
 
-# Write-protected = already complete
-if [ -f "$outfile" ] && [ ! -w "$outfile" ]; then
+# Check for either harmonised or raw output
+outfile_h="${stats_dir}/${idp}.h.tsv.gz"
+outfile_raw="${stats_dir}/${idp}.raw_hg19.tsv.gz"
+
+# Already complete (either format)
+if [ -f "$outfile_h" ] && [ ! -w "$outfile_h" ]; then
+    echo "SKIP  ${idp}"
+    exit 0
+fi
+if [ -f "$outfile_raw" ] && [ ! -w "$outfile_raw" ]; then
     echo "SKIP  ${idp}"
     exit 0
 fi
 
-url="${ebi_base}/${bucket}/${accession}/harmonised/${accession}.h.tsv.gz"
+# Try 1: harmonised file (most accessions have this)
+url_h="${acc_dir}/harmonised/${accession}.h.tsv.gz"
 
 if curl -fSL \
         --retry 3 \
         --retry-delay 10 \
         --connect-timeout 30 \
         --max-time 3600 \
-        -o "$outfile" \
-        "$url" 2>>"$log_file"; then
-    chmod a-w "$outfile"
-    echo "OK    ${idp} (${accession})  $(du -h "$outfile" | cut -f1)"
-else
-    rc=$?
-    rm -f "$outfile"
-    if [ $rc -eq 22 ]; then
-        echo "404   ${idp} (${accession})"
-    else
-        echo "FAIL  ${idp} (${accession})  rc=${rc}"
+        -o "$outfile_h" \
+        "$url_h" 2>>"$log_file"; then
+    chmod a-w "$outfile_h"
+    echo "OK    ${idp} (${accession})  $(du -h "$outfile_h" | cut -f1)"
+    exit 0
+fi
+rm -f "$outfile_h"
+
+# Try 2: raw TSV — download and gzip on the fly
+url_raw="${acc_dir}/${accession}_buildGRCh37.tsv"
+
+if curl -fSL \
+        --retry 3 \
+        --retry-delay 10 \
+        --connect-timeout 30 \
+        --max-time 7200 \
+        "$url_raw" 2>>"$log_file" \
+    | gzip > "$outfile_raw"; then
+
+    # Check that we actually got data (gzip of empty = 20 bytes)
+    if [ -s "$outfile_raw" ] && [ "$(stat -c%s "$outfile_raw" 2>/dev/null || stat -f%z "$outfile_raw")" -gt 100 ]; then
+        chmod a-w "$outfile_raw"
+        echo "OK    ${idp} (${accession})  $(du -h "$outfile_raw" | cut -f1)  [raw→gzip]"
+        exit 0
     fi
 fi
+rm -f "$outfile_raw"
+
+echo "FAIL  ${idp} (${accession})"
 WORKER_EOF
 chmod +x "$WORKER"
 
@@ -120,7 +144,7 @@ echo "============================================================"
 echo "  Download Summary"
 echo "============================================================"
 
-completed=$(find "$STATS_DIR" -name '*.h.tsv.gz' ! -writable 2>/dev/null | wc -l)
+completed=$(find "$STATS_DIR" -name '*.tsv.gz' ! -writable 2>/dev/null | wc -l)
 total=$(( IDP_LAST - IDP_FIRST + 1 ))
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Files complete: ${completed} / ${total}" \

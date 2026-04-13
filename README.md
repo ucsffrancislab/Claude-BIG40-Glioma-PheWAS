@@ -12,6 +12,9 @@ bash 01_download_big40.sh /scratch/big40_data
 # Kicked off the network? Just rerun:
 bash 01_download_big40.sh   # picks up where it left off
 
+
+bash 01_download_big40.sh /destination/path
+
 ```
 
 
@@ -28,5 +31,19 @@ data/big40/
 │   └── 3934.txt.gz
 └── download.log               # Timestamped log
 ```
+
+
+```bash
+bash 02_download_ebi.sh /destination/path
+
+```
+
+
+
+```bash
+03_validate_ebi.sh /destination/path
+
+```
+
 
 

@@ -2,12 +2,10 @@
 # =============================================================================
 # 01_download_big40.sh
 #
-# Downloads BIG40 reference files: variant annotation table.
+# Downloads BIG40 reference files and stats33k GWAS summary statistics.
 #
-# The stats33k GWAS files are commented out below — the Oxford server is
-# extremely slow (~500 KB/s, no parallel connections).  Use 02_download_ebi.sh
-# to grab the 22k discovery stats from EBI instead, and optionally meta-analyse
-# with the 11k replication stats later.
+#   Phase 1: Variant annotation table (variants.txt.gz, ~270 MB)
+#   Phase 2: stats33k GWAS summary stats (3,935 IDPs, parallel)
 #
 # Crash-safe design:
 #   - Before each download, checks if the file exists and is write-protected.
@@ -16,9 +14,10 @@
 #   - Rerun this script as many times as needed after network interruptions.
 #
 # Usage:
-#   bash 01_download_big40.sh [DATA_DIR]
+#   bash 01_download_big40.sh [DATA_DIR] [NJOBS]
 #
-#   DATA_DIR  Base directory for all downloads (default: data/big40)
+#   DATA_DIR  Base directory for all downloads  (default: data/big40)
+#   NJOBS     Parallel download workers         (default: 4)
 #
 # Reference:
 #   Smith et al. (2021) Nature Neuroscience 24(5):737-745
@@ -29,10 +28,17 @@ set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
+STATS_URL="https://open.win.ox.ac.uk/ukbiobank/big40/release2/stats33k"
 VARIANT_URL="https://open.oxcin.ox.ac.uk/ukbiobank/big40/release2/variants.txt.gz"
 
 DATA_DIR="${1:-data/big40}"
+NJOBS="${2:-4}"
+STATS_DIR="${DATA_DIR}/stats33k"
 LOG_FILE="${DATA_DIR}/download.log"
+
+# IDP files are 4-digit zero-padded: 0001.txt.gz .. 3935.txt.gz
+IDP_FIRST=1
+IDP_LAST=3935
 
 # ── Helper functions ─────────────────────────────────────────────────────────
 
@@ -43,12 +49,10 @@ log() {
 }
 
 # safe_download <url> <output_path>
-#   Returns 0 on success or skip, nonzero on failure.
 safe_download() {
     local url="$1"
     local out="$2"
 
-    # Write-protected = already complete
     if [[ -f "$out" && ! -w "$out" ]]; then
         return 0
     fi
@@ -71,17 +75,14 @@ safe_download() {
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
-mkdir -p "$DATA_DIR"
-log "Download session started.  DATA_DIR=${DATA_DIR}"
+mkdir -p "$STATS_DIR"
+log "Download session started.  DATA_DIR=${DATA_DIR}  NJOBS=${NJOBS}"
 
-# ── Variant annotation ──────────────────────────────────────────────────────
-#
-# Shared SNP table for all IDPs: chr rsid pos a1 a2 af info
-# This is needed regardless of whether we use stats33k, stats (22k), or repro (11k).
+# ── Phase 1: Variant annotation ─────────────────────────────────────────────
 
 echo ""
 echo "============================================================"
-echo "  Variant annotation  (variants.txt.gz, ~270 MB)"
+echo "  Phase 1 / 2 :  Variant annotation  (variants.txt.gz)"
 echo "============================================================"
 
 VARIANT_FILE="${DATA_DIR}/variants.txt.gz"
@@ -89,7 +90,7 @@ VARIANT_FILE="${DATA_DIR}/variants.txt.gz"
 if [[ -f "$VARIANT_FILE" && ! -w "$VARIANT_FILE" ]]; then
     log "variants.txt.gz already complete (write-protected)."
 else
-    log "Downloading variants.txt.gz ..."
+    log "Downloading variants.txt.gz (~270 MB) ..."
     log "  URL: ${VARIANT_URL}"
     if safe_download "$VARIANT_URL" "$VARIANT_FILE"; then
         log "  OK   variants.txt.gz  ($(du -h "$VARIANT_FILE" | cut -f1))"
@@ -98,33 +99,73 @@ else
     fi
 fi
 
-# ── Stats33k GWAS summary statistics (DISABLED) ─────────────────────────────
-#
-# The Oxford server throttles downloads to ~500 KB/s per connection and blocks
-# parallel connections.  At ~10 min per file × 3,935 files ≈ 1 month.
-#
-# Instead, use 02_download_ebi.sh to get the 22k discovery stats from the EBI
-# GWAS Catalog FTP.  If you need full 33k power, you can also download the 11k
-# replication stats from release2/repro/ and meta-analyse with the 22k.
-#
-# To re-enable: uncomment the block below and run this script.
-#
-# STATS_URL="https://open.win.ox.ac.uk/ukbiobank/big40/release2/stats33k"
-# STATS_DIR="${DATA_DIR}/stats33k"
-# mkdir -p "$STATS_DIR"
-#
-# for (( n=1; n<=3935; n++ )); do
-#     idp=$(printf "%04d" "$n")
-#     outfile="${STATS_DIR}/${idp}.txt.gz"
-#     if [[ -f "$outfile" && ! -w "$outfile" ]]; then
-#         continue
-#     fi
-#     printf "  [%04d / 3935]  IDP %s  downloading ...\n" "$n" "$idp"
-#     if safe_download "${STATS_URL}/${idp}.txt.gz" "$outfile"; then
-#         printf "  [%04d / 3935]  IDP %s  OK  (%s)\n" "$n" "$idp" "$(du -h "$outfile" | cut -f1)"
-#     else
-#         printf "  [%04d / 3935]  IDP %s  FAIL\n" "$n" "$idp"
-#     fi
-# done
+# ── Phase 2: stats33k GWAS summary statistics (parallel) ────────────────────
 
-log "Done."
+echo ""
+echo "============================================================"
+echo "  Phase 2 / 2 :  stats33k GWAS summary statistics"
+echo "  Workers: ${NJOBS}"
+echo "============================================================"
+
+WORKER=$(mktemp)
+cat > "$WORKER" << 'WORKER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+n="$1"
+stats_url="$2"
+stats_dir="$3"
+log_file="$4"
+
+idp=$(printf "%04d" "$n")
+outfile="${stats_dir}/${idp}.txt.gz"
+
+# Write-protected = already complete
+if [ -f "$outfile" ] && [ ! -w "$outfile" ]; then
+    echo "SKIP  ${idp}"
+    exit 0
+fi
+
+if curl -fSL \
+        --retry 3 \
+        --retry-delay 10 \
+        --connect-timeout 30 \
+        --max-time 3600 \
+        -o "$outfile" \
+        "${stats_url}/${idp}.txt.gz" 2>>"$log_file"; then
+    chmod a-w "$outfile"
+    echo "OK    ${idp}  $(du -h "$outfile" | cut -f1)"
+else
+    rc=$?
+    rm -f "$outfile"
+    if [ $rc -eq 22 ]; then
+        echo "404   ${idp}"
+    else
+        echo "FAIL  ${idp}  rc=${rc}"
+    fi
+fi
+WORKER_EOF
+chmod +x "$WORKER"
+
+seq "$IDP_FIRST" "$IDP_LAST" \
+    | xargs -P "$NJOBS" -I {} \
+        bash "$WORKER" {} "$STATS_URL" "$STATS_DIR" "$LOG_FILE"
+
+rm -f "$WORKER"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+echo ""
+echo "============================================================"
+echo "  Download Summary"
+echo "============================================================"
+
+completed=$(find "$STATS_DIR" -name '*.txt.gz' ! -writable 2>/dev/null | wc -l)
+total=$(( IDP_LAST - IDP_FIRST + 1 ))
+
+log "Files complete: ${completed} / ${total}"
+
+if [ "$completed" -lt "$total" ]; then
+    log "Some files still missing (gaps in IDP numbering are normal)."
+    log "Rerun to retry any network failures."
+fi

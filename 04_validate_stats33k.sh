@@ -67,7 +67,7 @@ for f in "${STATS_DIR}"/*.txt.gz; do
     fi
 
     header=$(echo "$chunk" | head -1)
-    ncols=$(echo "$header" | awk -F'\t' '{print NF}')
+    ncols=$(echo "$header" | awk '{print NF}')
 
     # 2. Column count — compare against first file
     if [ -z "$ref_header" ]; then
@@ -83,7 +83,7 @@ for f in "${STATS_DIR}"/*.txt.gz; do
     # 3. Numeric spot-check at row 1000
     spot=$(echo "$chunk" | tail -1)
     if [ -n "$spot" ]; then
-        bad=$(echo "$spot" | tr '\t' '\n' \
+        bad=$(echo "$spot" | tr ' ' '\n' \
             | grep -cvE '^-?[0-9]|^NA$|^NaN$|^na$|^nan$|^\.$|^$' || true)
         if [ "$bad" -gt 0 ]; then
             status="WARN"
@@ -113,7 +113,7 @@ log ""
 
 if [ -n "$ref_header" ]; then
     log "  Reference header (${ref_fname}, ${ref_ncols} columns):"
-    log "  $(echo "$ref_header" | tr '\t' '\n' | cat -n || true)"
+    log "  $(echo "$ref_header" | tr ' ' '\n' | cat -n || true)"
 fi
 
 log ""

@@ -4,15 +4,13 @@
 #
 # Fast validation of downloaded stats33k GWAS summary statistics.
 #
-# Checks per file:
-#   1. gzip integrity  (gzip -t — reads full file but no pipe overhead)
-#   2. Column count    (header should have 8 fields: beta se neglog10p per SNP,
-#                       but the variant info is in variants.txt.gz so each
-#                       per-IDP file may just have 3 columns)
-#   3. Numeric spot-check (row 1000 — are the values actually numbers?)
+# Checks per file (all fast — reads only the first ~1000 lines):
+#   1. Not empty
+#   2. Column count matches the first file (consistent format)
+#   3. Numeric spot-check at row 1000
 #
-# Deliberately skips full row count (zcat | wc -l) since that was taking
-# minutes per file for a marginal check.
+# Skips full gzip integrity check (gzip -t) since the write-protection
+# download pattern already ensures complete downloads.
 #
 # Usage:
 #   bash 04_validate_stats33k.sh [DATA_DIR]
@@ -39,14 +37,12 @@ log "================================================================"
 log ""
 
 n_ok=0
-n_gzip_fail=0
-n_header_fail=0
-n_numeric_fail=0
-n_empty=0
+n_fail=0
 total=0
 
-# Grab the header from the first valid file to use as reference
 ref_header=""
+ref_ncols=""
+ref_fname=""
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 
@@ -55,59 +51,53 @@ for f in "${STATS_DIR}"/*.txt.gz; do
     total=$((total + 1))
     fname=$(basename "$f")
     idp="${fname%.txt.gz}"
-    errors=""
+    status="OK"
+    note=""
 
-    # 1. gzip integrity
-    if ! gzip -t "$f" 2>/dev/null; then
-        n_gzip_fail=$((n_gzip_fail + 1))
-        log "FAIL  ${fname}  gzip corrupt"
+    # Read first 1000 lines once, reuse for all checks
+    chunk=$(zcat "$f" | head -1000 || true)
+
+    # 1. Empty check
+    if [ -z "$chunk" ]; then
+        status="FAIL"
+        note="empty file"
+        n_fail=$((n_fail + 1))
+        log "$(printf "  %-6s %-16s %s" "$status" "$fname" "$note")"
         continue
     fi
 
-    # 2. Header / column check
-    header=$(zcat "$f" | head -1 || true)
-
-    if [ -z "$header" ]; then
-        n_empty=$((n_empty + 1))
-        log "FAIL  ${fname}  empty file"
-        continue
-    fi
-
+    header=$(echo "$chunk" | head -1)
     ncols=$(echo "$header" | awk -F'\t' '{print NF}')
 
-    # Store first header as reference; flag if others differ
+    # 2. Column count — compare against first file
     if [ -z "$ref_header" ]; then
         ref_header="$header"
         ref_ncols="$ncols"
         ref_fname="$fname"
     elif [ "$ncols" != "$ref_ncols" ]; then
-        errors="${errors}  WARN column count ${ncols} differs from ${ref_fname} (${ref_ncols})\n"
-        n_header_fail=$((n_header_fail + 1))
+        status="WARN"
+        note="cols=${ncols} (expected ${ref_ncols})"
+        n_fail=$((n_fail + 1))
     fi
 
-    # 3. Numeric spot-check: row 1000
-    spot=$(zcat "$f" | head -1000 | tail -1 || true)
+    # 3. Numeric spot-check at row 1000
+    spot=$(echo "$chunk" | tail -1)
     if [ -n "$spot" ]; then
-        # Check that all fields look numeric (allow scientific notation, NA, -, .)
-        bad_fields=$(echo "$spot" | tr '\t' '\n' \
+        bad=$(echo "$spot" | tr '\t' '\n' \
             | grep -cvE '^-?[0-9]|^NA$|^NaN$|^na$|^nan$|^\.$|^$' || true)
-        if [ "$bad_fields" -gt 0 ]; then
-            errors="${errors}  WARN ${bad_fields} non-numeric field(s) at row 1000\n"
-            n_numeric_fail=$((n_numeric_fail + 1))
+        if [ "$bad" -gt 0 ]; then
+            status="WARN"
+            note="${note:+${note}; }${bad} non-numeric field(s)"
+            n_fail=$((n_fail + 1))
         fi
     fi
 
-    # Report
-    if [ -z "$errors" ]; then
+    if [ "$status" = "OK" ]; then
         n_ok=$((n_ok + 1))
-        # Print progress every 100 files, or for failures
-        if (( total % 100 == 0 )); then
-            printf "  [%4d]  OK so far: %d\n" "$total" "$n_ok"
-        fi
-    else
-        printf "  WARN  %-20s  %d cols\n" "$fname" "$ncols"
-        printf "$errors" | tee -a "$REPORT"
     fi
+
+    printf "  %-6s %-16s %d cols  %s\n" "$status" "$fname" "$ncols" "$note"
+
 done
 
 # ── Summary ──────────────────────────────────────────────────────────────────
@@ -116,18 +106,13 @@ log ""
 log "================================================================"
 log "  Summary"
 log "================================================================"
-log "  Total files      : ${total}"
-log "  Passed           : ${n_ok}"
-log "  gzip failures    : ${n_gzip_fail}"
-log "  Empty files      : ${n_empty}"
-log "  Column mismatches: ${n_header_fail}"
-log "  Numeric warns    : ${n_numeric_fail}"
+log "  Total files : ${total}"
+log "  Passed      : ${n_ok}"
+log "  Warnings    : ${n_fail}"
 log ""
 
-# Show reference header
 if [ -n "$ref_header" ]; then
-    log "  Reference header (${ref_fname}):"
-    log "  Columns: ${ref_ncols}"
+    log "  Reference header (${ref_fname}, ${ref_ncols} columns):"
     log "  $(echo "$ref_header" | tr '\t' '\n' | cat -n || true)"
 fi
 

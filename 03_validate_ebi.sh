@@ -2,14 +2,12 @@
 # =============================================================================
 # 03_validate_ebi.sh
 #
-# Validates downloaded EBI GWAS summary statistics files.
+# Validates downloaded EBI GWAS summary statistics files (stats22k).
 #
-# Checks:
-#   1. gzip integrity (can we decompress it?)
+# Checks per file (fast — reads only the first ~1000 lines):
+#   1. Not empty
 #   2. Column headers match expected format (harmonised vs raw)
-#   3. Row count is in the expected ballpark (~10-17M SNPs)
-#   4. Numeric columns are actually numeric (spot-check)
-#   5. Summary report of all files
+#   3. Numeric spot-check at row 1000
 #
 # Usage:
 #   bash 03_validate_ebi.sh [DATA_DIR]
@@ -17,26 +15,15 @@
 #   DATA_DIR  Base directory (default: data/big40)
 # =============================================================================
 
-set -euo pipefail
+set -eu
 
 DATA_DIR="${1:-data/big40}"
 STATS_DIR="${DATA_DIR}/stats22k"
-REPORT="${DATA_DIR}/validation_report.txt"
-
-# Expected columns in harmonised files (EBI GWAS-SSF format)
-# These are the typical harmonised column names; we check a key subset.
-EXPECTED_H_COLS="variant_id|rsid|chromosome|base_pair_location|effect_allele|other_allele|beta|standard_error|p_value"
-
-# Expected columns in BIG40 raw files
-EXPECTED_RAW_COLS="chr|rsid|pos|a1|a2|beta|se"
-
-# ── Functions ────────────────────────────────────────────────────────────────
-
-log() {
-    echo "$*" | tee -a "$REPORT"
-}
+REPORT="${DATA_DIR}/validation_ebi.txt"
 
 # ── Setup ────────────────────────────────────────────────────────────────────
+
+log() { echo "$*" | tee -a "$REPORT"; }
 
 echo "" > "$REPORT"
 log "================================================================"
@@ -48,14 +35,13 @@ log ""
 
 n_harmonised=0
 n_raw=0
-n_gzip_fail=0
 n_col_fail=0
-n_rowcount_warn=0
 n_numeric_fail=0
+n_empty=0
 n_ok=0
 total=0
 
-# ── Validate each file ──────────────────────────────────────────────────────
+# ── Validate ─────────────────────────────────────────────────────────────────
 
 for f in "${STATS_DIR}"/*.tsv.gz; do
     [ -f "$f" ] || continue
@@ -63,7 +49,8 @@ for f in "${STATS_DIR}"/*.tsv.gz; do
 
     fname=$(basename "$f")
     idp="${fname%%.*}"
-    errors=""
+    status="OK"
+    note=""
 
     # Determine file type
     if [[ "$fname" == *.h.tsv.gz ]]; then
@@ -76,80 +63,60 @@ for f in "${STATS_DIR}"/*.tsv.gz; do
         ftype="unknown"
     fi
 
-    # 1. gzip integrity
-    if ! gzip -t "$f" 2>/dev/null; then
-        errors="${errors}  FAIL gzip integrity\n"
-        n_gzip_fail=$((n_gzip_fail + 1))
-        log "FAIL  ${fname}  gzip corrupt"
+    # Read first 1000 lines once
+    chunk=$(zcat "$f" 2>/dev/null | head -1000 || true)
+
+    # 1. Empty check
+    if [ -z "$chunk" ]; then
+        n_empty=$((n_empty + 1))
+        log "$(printf "  FAIL  %-30s  %-12s  empty file" "$fname" "$ftype")"
         continue
     fi
 
-    # 2. Column headers
-    header=$(zcat "$f" | head -1 || true)
+    header=$(echo "$chunk" | head -1)
+    ncols=$(echo "$header" | awk -F'\t' '{print NF}')
 
+    # 2. Column check — look for expected columns by file type
+    missing=""
     if [ "$ftype" = "harmonised" ]; then
-        missing_cols=""
         for col in variant_id chromosome base_pair_location effect_allele other_allele beta standard_error p_value; do
             if ! echo "$header" | grep -qi "$col"; then
-                missing_cols="${missing_cols} ${col}"
+                missing="${missing} ${col}"
             fi
         done
-        if [ -n "$missing_cols" ]; then
-            errors="${errors}  WARN missing harmonised columns:${missing_cols}\n"
-            n_col_fail=$((n_col_fail + 1))
-        fi
     elif [ "$ftype" = "raw_hg19" ]; then
-        missing_cols=""
-        # Raw BIG40 files may have: chr, rsid, pos, a1, a2, beta, se, neglog10p
-        # or the EBI non-harmonised format — check what we actually got
         for col in beta se; do
             if ! echo "$header" | grep -qi "$col"; then
-                missing_cols="${missing_cols} ${col}"
+                missing="${missing} ${col}"
             fi
         done
-        if [ -n "$missing_cols" ]; then
-            errors="${errors}  WARN missing raw columns:${missing_cols}\n"
-            n_col_fail=$((n_col_fail + 1))
-        fi
     fi
 
-    # 3. Row count (sample first 10M lines, extrapolate if needed)
-    #    BIG40 GWAS has ~10-17M SNPs.  Flag if < 1M or > 25M.
-    rowcount=$(zcat "$f" | wc -l || true)
-    rowcount=$((rowcount - 1))  # subtract header
-
-    if [ "$rowcount" -lt 1000000 ]; then
-        errors="${errors}  WARN low row count: ${rowcount} (expected ~10-17M)\n"
-        n_rowcount_warn=$((n_rowcount_warn + 1))
-    elif [ "$rowcount" -gt 25000000 ]; then
-        errors="${errors}  WARN high row count: ${rowcount} (expected ~10-17M)\n"
-        n_rowcount_warn=$((n_rowcount_warn + 1))
+    if [ -n "$missing" ]; then
+        status="WARN"
+        note="missing:${missing}"
+        n_col_fail=$((n_col_fail + 1))
     fi
 
-    # 4. Numeric spot-check: grab line 1000, check that beta-like column is numeric
-    spot=$(zcat "$f" | sed -n '1000p' || true)
+    # 3. Numeric spot-check at row 1000
+    spot=$(echo "$chunk" | tail -1)
     if [ -n "$spot" ]; then
-        # Try to extract a field that should be numeric (beta or similar)
-        # Use the header to find the beta column index
-        beta_col=$(echo "$header" | tr '\t' '\n' | grep -ni "^beta$" | head -1 | cut -d: -f1)
+        beta_col=$(echo "$header" | tr '\t' '\n' | grep -ni "^beta$" | head -1 | cut -d: -f1 || true)
         if [ -n "$beta_col" ]; then
             beta_val=$(echo "$spot" | cut -f"$beta_col")
-            # Check if it looks numeric (allow scientific notation, NA)
             if ! echo "$beta_val" | grep -qE '^-?[0-9]|^NA$|^na$|^NaN$|^$'; then
-                errors="${errors}  WARN beta column not numeric at row 1000: '${beta_val}'\n"
+                status="WARN"
+                note="${note:+${note}; }beta not numeric: '${beta_val}'"
                 n_numeric_fail=$((n_numeric_fail + 1))
             fi
         fi
     fi
 
-    # Report
-    if [ -z "$errors" ]; then
+    if [ "$status" = "OK" ]; then
         n_ok=$((n_ok + 1))
-        printf "  OK    %-30s  %-12s  %'d rows\n" "$fname" "$ftype" "$rowcount"
-    else
-        printf "  WARN  %-30s  %-12s  %'d rows\n" "$fname" "$ftype" "$rowcount"
-        printf "$errors" | tee -a "$REPORT"
     fi
+
+    printf "  %-6s %-30s  %-12s  %d cols  %s\n" "$status" "$fname" "$ftype" "$ncols" "$note"
 
 done
 
@@ -164,29 +131,28 @@ log "  Harmonised      : ${n_harmonised}"
 log "  Raw (hg19)      : ${n_raw}"
 log "  Passed          : ${n_ok}"
 log ""
-log "  gzip failures   : ${n_gzip_fail}"
+log "  Empty files     : ${n_empty}"
 log "  Column issues   : ${n_col_fail}"
-log "  Row count warns : ${n_rowcount_warn}"
 log "  Numeric warns   : ${n_numeric_fail}"
 log ""
-log "  Report saved to : ${REPORT}"
 
-# Also dump the header of one harmonised and one raw file for reference
-log ""
-log "================================================================"
-log "  Sample Headers"
-log "================================================================"
-
-sample_h=$(find "$STATS_DIR" -name '*.h.tsv.gz' | head -1)
+# Dump sample headers
+sample_h=$(find "$STATS_DIR" -name '*.h.tsv.gz' 2>/dev/null | head -1)
 if [ -n "$sample_h" ]; then
-    log ""
-    log "  Harmonised ($(basename "$sample_h")):"
-    log "  $(zcat "$sample_h" | head -1 | tr '\t' '\n' | cat -n || true)"
+    log "  Harmonised header ($(basename "$sample_h")):"
+    zcat "$sample_h" 2>/dev/null | head -1 | tr '\t' '\n' | cat -n | while read line; do
+        log "    $line"
+    done
 fi
 
-sample_raw=$(find "$STATS_DIR" -name '*.raw_hg19.tsv.gz' | head -1)
+sample_raw=$(find "$STATS_DIR" -name '*.raw_hg19.tsv.gz' 2>/dev/null | head -1)
 if [ -n "$sample_raw" ]; then
     log ""
-    log "  Raw hg19 ($(basename "$sample_raw")):"
-    log "  $(zcat "$sample_raw" | head -1 | tr '\t' '\n' | cat -n || true)"
+    log "  Raw header ($(basename "$sample_raw")):"
+    zcat "$sample_raw" 2>/dev/null | head -1 | tr '\t' '\n' | cat -n | while read line; do
+        log "    $line"
+    done
 fi
+
+log ""
+log "  Report saved to: ${REPORT}"

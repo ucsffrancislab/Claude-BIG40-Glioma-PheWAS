@@ -18,7 +18,7 @@
 #   DATA_DIR  Base directory (default: data/big40)
 # =============================================================================
 
-set -euo pipefail
+set -eu
 
 DATA_DIR="${1:-data/big40}"
 STATS_DIR="${DATA_DIR}/stats33k"

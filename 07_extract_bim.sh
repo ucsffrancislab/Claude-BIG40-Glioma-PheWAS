@@ -1,86 +1,98 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 07a_extract_bim.sh
+# 07_extract_bim.sh
 #
-# Extracts a PLINK .bim file from imputed VCFs for PRS-CS.
-# PRS-CS needs a BIM to know which SNPs are in the target genotype data.
-# Only needs to be run once — any one cohort will do since imputed data
-# shares the same variant set.
+# Extracts PLINK .bim files from imputed VCFs for each cohort.
+# PRS-CS needs per-cohort BIMs because different genotyping arrays and
+# QC filters produce different variant sets even after imputation.
 #
 # Usage:
-#   bash 07a_extract_bim.sh <VCF_DIR> <OUT_PREFIX>
+#   bash 07_extract_bim.sh <INPUT_DIR> <OUT_DIR>
 #
-#   VCF_DIR     Directory containing chr{1..22}.dose.vcf.gz
-#   OUT_PREFIX  Output prefix for PLINK files (e.g., data/big40/target_bim/allchr)
+#   INPUT_DIR  Directory containing cohort subdirs (imputed-umich-*)
+#   OUT_DIR    Output directory for BIM files
 #
 # Example:
-#   bash 07a_extract_bim.sh input/imputed-umich-cidr data/big40/target_bim/allchr
+#   bash 07_extract_bim.sh input data/big40/target_bim
+#
+# Output:
+#   data/big40/target_bim/imputed-umich-cidr.bim
+#   data/big40/target_bim/imputed-umich-i370.bim
+#   data/big40/target_bim/imputed-umich-onco.bim
+#   data/big40/target_bim/imputed-umich-tcga.bim
 # =============================================================================
 
 set -eu
 
-VCF_DIR="${1:?Usage: 07a_extract_bim.sh <VCF_DIR> <OUT_PREFIX>}"
-OUT_PREFIX="${2:?Usage: 07a_extract_bim.sh <VCF_DIR> <OUT_PREFIX>}"
+INPUT_DIR="${1:?Usage: 07_extract_bim.sh <INPUT_DIR> <OUT_DIR>}"
+OUT_DIR="${2:?Usage: 07_extract_bim.sh <INPUT_DIR> <OUT_DIR>}"
 
-OUT_DIR=$(dirname "$OUT_PREFIX")
 mkdir -p "$OUT_DIR"
 
-# Check if BIM already exists and is write-protected
-if [ -f "${OUT_PREFIX}.bim" ] && [ ! -w "${OUT_PREFIX}.bim" ]; then
-    echo "BIM already exists (write-protected): ${OUT_PREFIX}.bim"
-    n=$(wc -l < "${OUT_PREFIX}.bim")
-    echo "  ${n} variants"
-    exit 0
-fi
-
 echo "============================================================"
-echo "  Extracting BIM from VCFs"
-echo "  VCF dir: ${VCF_DIR}"
-echo "  Output:  ${OUT_PREFIX}.bim"
+echo "  Extracting BIM files from imputed VCFs"
+echo "  Input:  ${INPUT_DIR}"
+echo "  Output: ${OUT_DIR}"
 echo "============================================================"
+echo ""
 
-# Process each chromosome: extract variant info only (no genotypes)
-# Using plink2 --make-just-bim to avoid reading dosages
-MERGE_LIST=$(mktemp)
+for cohort_dir in "${INPUT_DIR}"/imputed-umich-*; do
+    [ -d "$cohort_dir" ] || continue
 
-for chr in $(seq 1 22); do
-    vcf="${VCF_DIR}/chr${chr}.dose.vcf.gz"
-    chr_prefix="${OUT_DIR}/tmp_chr${chr}"
+    cohort=$(basename "$cohort_dir")
+    out_prefix="${OUT_DIR}/${cohort}"
 
-    if [ ! -f "$vcf" ]; then
-        echo "  WARNING: ${vcf} not found, skipping chr${chr}"
+    # Write-protected = already complete
+    if [ -f "${out_prefix}.bim" ] && [ ! -w "${out_prefix}.bim" ]; then
+        n=$(wc -l < "${out_prefix}.bim")
+        echo "SKIP  ${cohort}  (${n} variants, write-protected)"
         continue
     fi
 
-    echo "  chr${chr} ..."
+    echo "${cohort} ..."
 
-    plink2 \
-        --vcf "$vcf" dosage=DS \
-        --make-just-bim \
-        --out "$chr_prefix" \
-        --threads 1 \
-        --memory 2000 \
-        > /dev/null 2>&1
+    # Concatenate per-chromosome BIMs
+    cat /dev/null > "${out_prefix}.bim"
 
-    if [ -f "${chr_prefix}.bim" ]; then
-        echo "${chr_prefix}" >> "$MERGE_LIST"
-    fi
+    for chr in $(seq 1 22); do
+        vcf="${cohort_dir}/chr${chr}.dose.vcf.gz"
+
+        if [ ! -f "$vcf" ]; then
+            echo "  WARNING: ${vcf} not found, skipping chr${chr}"
+            continue
+        fi
+
+        chr_prefix="${OUT_DIR}/tmp_${cohort}_chr${chr}"
+
+        plink2 \
+            --vcf "$vcf" dosage=DS \
+            --make-just-bim \
+            --out "$chr_prefix" \
+            --threads 1 \
+            --memory 2000 \
+            > /dev/null 2>&1
+
+        if [ -f "${chr_prefix}.bim" ]; then
+            cat "${chr_prefix}.bim" >> "${out_prefix}.bim"
+            rm -f "${chr_prefix}.bim" "${chr_prefix}.log"
+        fi
+    done
+
+    n=$(wc -l < "${out_prefix}.bim")
+    chmod a-w "${out_prefix}.bim"
+    echo "  OK  ${cohort}  ${n} variants"
+    echo ""
+
 done
 
-# Concatenate all chromosome BIMs into one
-echo ""
-echo "  Merging chromosomes ..."
+# ── Summary ──────────────────────────────────────────────────────────────────
 
-cat /dev/null > "${OUT_PREFIX}.bim"
-while IFS= read -r prefix; do
-    cat "${prefix}.bim" >> "${OUT_PREFIX}.bim"
-    rm -f "${prefix}.bim" "${prefix}.log"
-done < "$MERGE_LIST"
-rm -f "$MERGE_LIST"
+echo "============================================================"
+echo "  Summary"
+echo "============================================================"
 
-n=$(wc -l < "${OUT_PREFIX}.bim")
-echo "  Total variants: ${n}"
-
-chmod a-w "${OUT_PREFIX}.bim"
-echo "  Wrote: ${OUT_PREFIX}.bim"
-echo "  Done."
+for bim in "${OUT_DIR}"/*.bim; do
+    [ -f "$bim" ] || continue
+    n=$(wc -l < "$bim")
+    printf "  %-40s  %'d variants\n" "$(basename "$bim")" "$n"
+done

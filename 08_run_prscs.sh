@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 07b_run_prscs.sbatch
+# 08_run_prscs.sh
 #
-# SLURM array job to run PRS-CS on all 3,935 BIG40 IDPs.
+# SLURM array job to run PRS-CS on all 3,935 BIG40 IDPs for one cohort.
+#
+# Run once per cohort:
+#   sbatch 08_run_prscs.sh imputed-umich-cidr
+#   sbatch 08_run_prscs.sh imputed-umich-i370
+#   sbatch 08_run_prscs.sh imputed-umich-onco
+#   sbatch 08_run_prscs.sh imputed-umich-tcga
 #
 # Each array task processes one IDP across all 22 chromosomes.
-# PRS-CS runs per-chromosome internally when --chrom is not specified,
-# or we can loop over chromosomes within each task.
-#
-# Usage:
-#   sbatch 07b_run_prscs.sbatch
 #
 # Before running:
 #   1. Complete 06_format_for_prscs.sh (summary stats formatted)
-#   2. Complete 07a_extract_bim.sh (target BIM extracted)
+#   2. Complete 07_extract_bim.sh (per-cohort BIMs extracted)
 #   3. Adjust paths below to match your setup
 # =============================================================================
 
@@ -22,8 +23,8 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --time=4:00:00
-#SBATCH --output=logs/prscs/prscs_%a.out
-#SBATCH --error=logs/prscs/prscs_%a.err
+#SBATCH --output=logs/prscs/%x_%a.out
+#SBATCH --error=logs/prscs/%x_%a.err
 
 set -eu
 
@@ -31,10 +32,22 @@ set -eu
 
 PRSCS_PY="${HOME}/.local/PRScs/PRScs.py"
 LD_REF="${HOME}/.local/ld_ref/ldblk_1kg_eur"
-BIM_PREFIX="data/big40/target_bim/allchr"
+BIM_DIR="data/big40/target_bim"
 SST_DIR="data/big40/prscs_input"
-OUT_DIR="data/big40/prscs_output"
+OUT_BASE="data/big40/prscs_output"
 N_GWAS=33224
+
+# ── Cohort from command line argument ────────────────────────────────────────
+
+COHORT="${1:?Usage: sbatch 08_run_prscs.sh <cohort_name>}"
+BIM_PREFIX="${BIM_DIR}/${COHORT}"
+OUT_DIR="${OUT_BASE}/${COHORT}"
+
+if [ ! -f "${BIM_PREFIX}.bim" ]; then
+    echo "ERROR: BIM not found: ${BIM_PREFIX}.bim"
+    echo "  Run 07_extract_bim.sh first."
+    exit 1
+fi
 
 # ── Thread control (important for SLURM) ─────────────────────────────────────
 
@@ -50,12 +63,11 @@ IDP_OUT_DIR="${OUT_DIR}/${IDP}"
 
 # Check input exists
 if [ ! -f "$SST_FILE" ]; then
-    echo "ERROR: Summary stats not found: ${SST_FILE}"
-    echo "  IDP ${IDP} may not exist (gap in numbering). Exiting."
+    echo "SKIP  IDP ${IDP}  (no summary stats — gap in numbering)"
     exit 0
 fi
 
-# Check if already complete (all 22 chromosome output files exist and are write-protected)
+# Check if already complete (all 22 chromosome output files write-protected)
 n_complete=0
 for chr in $(seq 1 22); do
     outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
@@ -65,7 +77,7 @@ for chr in $(seq 1 22); do
 done
 
 if [ "$n_complete" -eq 22 ]; then
-    echo "SKIP  IDP ${IDP}  (all 22 chromosomes complete)"
+    echo "SKIP  IDP ${IDP} ${COHORT}  (all 22 chromosomes complete)"
     exit 0
 fi
 
@@ -73,17 +85,11 @@ fi
 
 mkdir -p "$IDP_OUT_DIR" "logs/prscs"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting PRS-CS for IDP ${IDP}"
-echo "  Summary stats: ${SST_FILE}"
-echo "  LD reference:  ${LD_REF}"
-echo "  BIM prefix:    ${BIM_PREFIX}"
-echo "  N GWAS:        ${N_GWAS}"
-echo "  Output dir:    ${IDP_OUT_DIR}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] PRS-CS  IDP=${IDP}  cohort=${COHORT}"
 
 for chr in $(seq 1 22); do
     outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
 
-    # Skip chromosomes already done
     if [ -f "$outfile" ] && [ ! -w "$outfile" ]; then
         echo "  chr${chr} ... SKIP"
         continue
@@ -100,17 +106,15 @@ for chr in $(seq 1 22); do
         --out_dir="$IDP_OUT_DIR" \
         --out_name="$IDP"
 
-    # Write-protect completed output
     if [ -f "$outfile" ]; then
         chmod a-w "$outfile"
         echo "  chr${chr} ... OK"
     else
-        echo "  chr${chr} ... FAIL (no output file)"
+        echo "  chr${chr} ... FAIL (no output)"
     fi
 done
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 
 n_done=$(find "$IDP_OUT_DIR" -name "${IDP}_pst_eff_*_chr*.txt" ! -writable 2>/dev/null | wc -l)
-echo ""
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] IDP ${IDP} complete: ${n_done}/22 chromosomes"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] IDP ${IDP} ${COHORT}: ${n_done}/22 chromosomes"

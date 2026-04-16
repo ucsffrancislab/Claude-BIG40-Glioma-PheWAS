@@ -28,6 +28,8 @@
 
 set -eu
 
+module load plink2
+
 # ── Configuration — EDIT THESE PATHS ─────────────────────────────────────────
 
 PRSCS_PY="${HOME}/.local/PRScs/PRScs.py"

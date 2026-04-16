@@ -24,6 +24,8 @@
 
 set -eu
 
+module load plink2
+
 INPUT_DIR="${1:?Usage: 07_extract_bim.sh <INPUT_DIR> <OUT_DIR>}"
 OUT_DIR="${2:?Usage: 07_extract_bim.sh <INPUT_DIR> <OUT_DIR>}"
 

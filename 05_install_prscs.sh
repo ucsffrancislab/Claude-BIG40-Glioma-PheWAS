@@ -10,7 +10,7 @@
 #
 # Requirements:
 #   - Python 3 with scipy and h5py
-#   - ~5 GB disk for the LD reference panel
+#   - ~4.2 GB disk for the LD reference panel
 #
 # Usage:
 #   bash 05_install_prscs.sh [INSTALL_DIR]
@@ -72,7 +72,7 @@ fi
 # ── Step 3: Download 1000 Genomes EUR LD reference panel ────────────────────
 #
 # The LD reference panels are HDF5 files, one per chromosome.
-# 1000G EUR panel is ~3.5 GB compressed, ~5 GB extracted.
+# 1000G EUR panel is ~4.2 GB compressed.
 #
 # Download URL from the PRS-CS GitHub:
 #   https://www.dropbox.com/s/p9aqanhxhxcruzz/ldblk_1kg_eur.tar.gz
@@ -88,7 +88,7 @@ echo "============================================================"
 LD_TARBALL="${INSTALL_DIR}/ldblk_1kg_eur.tar.gz"
 LD_EXTRACTED="${LD_DIR}/ldblk_1kg_eur"
 
-if [ -d "$LD_EXTRACTED" ] && [ -f "${LD_EXTRACTED}/ldblk_1kg_chr1.hdf5" ]; then
+if [ -d "$LD_EXTRACTED" ] && [ -f "${LD_EXTRACTED}/snpinfo_1kg_hm3" ]; then
     echo "LD reference already extracted at ${LD_EXTRACTED}"
 else
     mkdir -p "${LD_DIR}"
@@ -96,10 +96,9 @@ else
     if [ -f "$LD_TARBALL" ]; then
         echo "Tarball already downloaded."
     else
-        echo "Downloading 1000G EUR LD panel (~3.5 GB) ..."
+        echo "Downloading 1000G EUR LD panel (~4.2 GB) ..."
         echo "  This will take a while."
-        curl -L -o "$LD_TARBALL" \
-            "https://www.dropbox.com/s/p9aqanhxhxcruzz/ldblk_1kg_eur.tar.gz"
+        wget -O "$LD_TARBALL"             "https://www.dropbox.com/s/mt6var0z96vb6fv/ldblk_1kg_eur.tar.gz?dl=1"
         echo "  Download complete."
     fi
 
@@ -112,6 +111,11 @@ else
     echo "  Found ${n_chr} chromosome LD files."
     if [ "$n_chr" -lt 22 ]; then
         echo "  WARNING: Expected 22 chromosome files!"
+    fi
+    if [ -f "${LD_EXTRACTED}/snpinfo_1kg_hm3" ]; then
+        echo "  SNP info file: snpinfo_1kg_hm3 ... OK"
+    else
+        echo "  WARNING: snpinfo_1kg_hm3 not found!"
     fi
 fi
 

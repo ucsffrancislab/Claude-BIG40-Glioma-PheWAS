@@ -134,14 +134,16 @@ for chr in $(seq 1 22); do
 
     echo "  chr${chr} ... running"
 
+    # NOTE: PRS-CS's --out_dir is actually a filename PREFIX, not a directory.
+    # It gets concatenated with '_pst_eff_a1_b0.5_phiauto_chr<N>.txt'.
+    # So we pass <dir>/<IDP> to produce <dir>/<IDP>_pst_eff_..._chr<N>.txt.
     python3 "$PRSCS_PY" \
         --ref_dir="$LD_REF" \
         --bim_prefix="$BIM_PREFIX" \
         --sst_file="$SST_FILE" \
         --n_gwas="$N_GWAS" \
         --chrom="$chr" \
-        --out_dir="$IDP_OUT_DIR" \
-        --out_name="$IDP"
+        --out_dir="${IDP_OUT_DIR}/${IDP}"
 
     if [ -f "$outfile" ]; then
         chmod a-w "$outfile"

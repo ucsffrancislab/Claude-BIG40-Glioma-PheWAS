@@ -4,14 +4,20 @@
 #
 # Patch a local PRS-CS install for NumPy 2.x compatibility.
 #
-# Fixes TypeError in gigrnd.py ("only 0-dimensional arrays can be converted
-# to Python scalars") by rewriting the call site in mcmc_gtb.py to pass
-# scalars instead of 1-element arrays.
+# Two fixes in mcmc_gtb.py:
+#   (1) gigrnd call site: index 2-D arrays as [jj,0] and cast to float
+#       (fixes "float(b)" error in gigrnd.py line 38)
+#   (2) sigma: cast to float after computation, because the preceding
+#       err computation uses Python's built-in sum() on 2-D arrays which
+#       returns 1-D results, making sigma a (1,) array that propagates
+#       through n*beta[jj,0]**2/sigma.
 #
-# Idempotent — safe to re-run. Backs up the original as mcmc_gtb.py.bak.
+# Idempotent. Backs up the original as mcmc_gtb.py.bak (first run only;
+# re-running does not overwrite the .bak).
 #
 # Usage:
-#   bash patch_prscs_numpy2.sh [PRSCS_DIR]      # default: ~/.local/PRScs
+#   bash patch_prscs_numpy2.sh [PRSCS_DIR]
+#   default PRSCS_DIR: /c4/home/gwendt/.local/PRScs
 # =============================================================================
 set -eu
 
@@ -23,29 +29,46 @@ if [ ! -f "$FILE" ]; then
     exit 1
 fi
 
-# The original line (as shipped by upstream):
-OLD='psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)'
-# Patched: index 2-D arrays with [jj,0] so we pass scalars to gigrnd
-NEW='psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))'
-
-if grep -qF "$NEW" "$FILE"; then
-    echo "already patched: $FILE"
-    exit 0
+# Backup once (preserve the truly-original)
+if [ ! -f "${FILE}.bak" ]; then
+    cp "$FILE" "${FILE}.bak"
+    echo "backup created: ${FILE}.bak"
 fi
 
-if ! grep -qF "$OLD" "$FILE"; then
-    echo "ERROR: expected line not found in $FILE"
-    echo "       (upstream may have changed; please inspect manually)"
-    exit 1
-fi
+# --- Fix 1: gigrnd call site ---
+OLD1='psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)'
+NEW1='psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))'
 
-cp "$FILE" "${FILE}.bak"
-python3 - "$FILE" "$OLD" "$NEW" <<PYEOF
+# --- Fix 2: sigma scalar cast ---
+OLD2='sigma = 1.0/random.gamma((n+p)/2.0, 1.0/err)'
+NEW2='sigma = float(1.0/random.gamma((n+p)/2.0, 1.0/err))'
+
+python3 - "$FILE" <<'PYEOF'
 import sys
-fp, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+fp = sys.argv[1]
 s = open(fp).read()
-assert old in s
-open(fp, "w").write(s.replace(old, new))
-print(f"patched: {fp}")
-print(f"backup:  {fp}.bak")
+
+subs = [
+    ("psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)",
+     "psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))"),
+    ("sigma = 1.0/random.gamma((n+p)/2.0, 1.0/err)",
+     "sigma = float(1.0/random.gamma((n+p)/2.0, 1.0/err))"),
+]
+
+changes = 0
+already = 0
+for old, new in subs:
+    if new in s:
+        already += 1
+        continue
+    if old not in s:
+        print(f"ERROR: expected pattern not found: {old!r}", file=sys.stderr)
+        sys.exit(1)
+    s = s.replace(old, new)
+    changes += 1
+
+open(fp, "w").write(s)
+print(f"applied {changes} new change(s); {already} already in place")
 PYEOF
+
+echo "patched: $FILE"

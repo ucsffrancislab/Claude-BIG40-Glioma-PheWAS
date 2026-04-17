@@ -2,20 +2,25 @@
 # =============================================================================
 # 08_run_prscs.sh
 #
-# SLURM array job to run PRS-CS on all 3,935 BIG40 IDPs for one cohort.
+# SLURM array job: run PRS-CS on all 3,935 BIG40 IDPs for one cohort.
 #
-# Run once per cohort:
-#   sbatch 08_run_prscs.sh imputed-umich-cidr
-#   sbatch 08_run_prscs.sh imputed-umich-i370
-#   sbatch 08_run_prscs.sh imputed-umich-onco
-#   sbatch 08_run_prscs.sh imputed-umich-tcga
+# Usage:
+#   sbatch 08_run_prscs.sh <cohort> <out_base_dir>
 #
-# Each array task processes one IDP across all 22 chromosomes.
+#   <cohort> may be given with or without the 'imputed-umich-' prefix —
+#   the prefix is stripped for output-path purposes.
 #
-# Before running:
-#   1. Complete 06_format_for_prscs.sh (summary stats formatted)
-#   2. Complete 07_extract_bim.sh (per-cohort BIMs extracted)
-#   3. Adjust paths below to match your setup
+# Examples:
+#   sbatch 08_run_prscs.sh cidr /francislab/data1/working/BIG40/prscs_output
+#   sbatch 08_run_prscs.sh imputed-umich-i370 /francislab/data1/working/BIG40/prscs_output
+#
+# Each array task = one IDP, looping chr1-22 internally.
+# Outputs are write-protected on success so reruns skip completed chromosomes.
+#
+# Inputs (NOT VCFs — VCFs are used only in step 09 for scoring):
+#   - Per-cohort BIM  : ${BIM_DIR}/<cohort>.bim  (w/ or w/o imputed-umich- prefix)
+#   - Summary stats   : ${SST_DIR}/<IDP>.txt[.gz]
+#   - LD reference    : ${LD_REF}/
 # =============================================================================
 
 #SBATCH --job-name=prscs
@@ -23,53 +28,66 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --time=4:00:00
-#SBATCH --output=logs/prscs/%x_%a.out
-#SBATCH --error=logs/prscs/%x_%a.err
+#SBATCH --output=logs/prscs/%x_%A_%a.out
+#SBATCH --error=logs/prscs/%x_%A_%a.err
 
 set -eu
 
-module load plink2
-
-# ── Configuration — EDIT THESE PATHS ─────────────────────────────────────────
-
+# ── Configuration ────────────────────────────────────────────────────────────
 PRSCS_PY="${HOME}/.local/PRScs/PRScs.py"
 LD_REF="${HOME}/.local/ld_ref/ldblk_1kg_eur"
-BIM_DIR="data/big40/target_bim"
-SST_DIR="data/big40/prscs_input"
-OUT_BASE="data/big40/prscs_output"
+SST_DIR="/francislab/data1/refs/BIG40/prscs_input"
+BIM_DIR="/francislab/data1/refs/BIG40/target_bim"
 N_GWAS=33224
 
-# ── Cohort from command line argument ────────────────────────────────────────
+# ── CLI arguments ────────────────────────────────────────────────────────────
+COHORT_RAW="${1:?Usage: sbatch 08_run_prscs.sh <cohort> <out_base_dir>}"
+OUT_BASE="${2:?Usage: sbatch 08_run_prscs.sh <cohort> <out_base_dir>}"
 
-COHORT="${1:?Usage: sbatch 08_run_prscs.sh <cohort_name>}"
-BIM_PREFIX="${BIM_DIR}/${COHORT}"
+# Strip 'imputed-umich-' prefix so it doesn't pollute output paths
+COHORT="${COHORT_RAW#imputed-umich-}"
+
+# Locate BIM: try clean name first, then with prefix
+if   [ -f "${BIM_DIR}/${COHORT}.bim" ]; then
+    BIM_PREFIX="${BIM_DIR}/${COHORT}"
+elif [ -f "${BIM_DIR}/imputed-umich-${COHORT}.bim" ]; then
+    BIM_PREFIX="${BIM_DIR}/imputed-umich-${COHORT}"
+else
+    echo "ERROR: BIM not found for cohort '${COHORT}'. Tried:"
+    echo "  ${BIM_DIR}/${COHORT}.bim"
+    echo "  ${BIM_DIR}/imputed-umich-${COHORT}.bim"
+    exit 1
+fi
+
 OUT_DIR="${OUT_BASE}/${COHORT}"
 
-if [ ! -f "${BIM_PREFIX}.bim" ]; then
-    echo "ERROR: BIM not found: ${BIM_PREFIX}.bim"
-    echo "  Run 07_extract_bim.sh first."
+if [ ! -d "$SST_DIR" ]; then
+    echo "ERROR: Summary stats dir not found: $SST_DIR"
     exit 1
 fi
 
 # ── Thread control (important for SLURM) ─────────────────────────────────────
-
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 
 # ── Determine IDP for this array task ────────────────────────────────────────
-
 IDP=$(printf "%04d" "${SLURM_ARRAY_TASK_ID}")
-SST_FILE="${SST_DIR}/${IDP}.txt"
 IDP_OUT_DIR="${OUT_DIR}/${IDP}"
 
-# Check input exists
-if [ ! -f "$SST_FILE" ]; then
+# Locate summary stats (accept .txt or .txt.gz)
+if   [ -f "${SST_DIR}/${IDP}.txt.gz" ]; then
+    SST_SRC="${SST_DIR}/${IDP}.txt.gz"
+    SST_IS_GZ=1
+elif [ -f "${SST_DIR}/${IDP}.txt" ]; then
+    SST_SRC="${SST_DIR}/${IDP}.txt"
+    SST_IS_GZ=0
+else
     echo "SKIP  IDP ${IDP}  (no summary stats — gap in numbering)"
     exit 0
 fi
 
-# Check if already complete (all 22 chromosome output files write-protected)
+# Check if already complete (all 22 chromosome outputs write-protected)
 n_complete=0
 for chr in $(seq 1 22); do
     outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
@@ -83,11 +101,21 @@ if [ "$n_complete" -eq 22 ]; then
     exit 0
 fi
 
-# ── Run PRS-CS ───────────────────────────────────────────────────────────────
+# ── Decompress to node-local scratch if gzipped ──────────────────────────────
+# PRS-CS opens the sst file with plain open() (twice) — no native gzip support.
+# $TMPDIR is SLURM's per-job local scratch, auto-cleaned at job exit.
+SCRATCH="${TMPDIR:-/tmp}"
+if [ "$SST_IS_GZ" -eq 1 ]; then
+    SST_FILE="${SCRATCH}/${IDP}.txt"
+    zcat "$SST_SRC" > "$SST_FILE"
+else
+    SST_FILE="$SST_SRC"
+fi
 
+# ── Run PRS-CS ───────────────────────────────────────────────────────────────
 mkdir -p "$IDP_OUT_DIR" "logs/prscs"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] PRS-CS  IDP=${IDP}  cohort=${COHORT}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] PRS-CS  IDP=${IDP}  cohort=${COHORT}  out=${OUT_DIR}"
 
 for chr in $(seq 1 22); do
     outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
@@ -116,7 +144,11 @@ for chr in $(seq 1 22); do
     fi
 done
 
-# ── Verify ───────────────────────────────────────────────────────────────────
+# ── Clean up scratch (belt-and-braces; $TMPDIR is auto-removed) ──────────────
+if [ "$SST_IS_GZ" -eq 1 ] && [ -f "$SST_FILE" ]; then
+    rm -f "$SST_FILE"
+fi
 
+# ── Verify ───────────────────────────────────────────────────────────────────
 n_done=$(find "$IDP_OUT_DIR" -name "${IDP}_pst_eff_*_chr*.txt" ! -writable 2>/dev/null | wc -l)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] IDP ${IDP} ${COHORT}: ${n_done}/22 chromosomes"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] IDP ${IDP} ${COHORT}: ${n_done}/22 chromosomes complete"

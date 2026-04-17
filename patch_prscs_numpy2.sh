@@ -15,7 +15,7 @@
 # =============================================================================
 set -eu
 
-PRSCS_DIR="${1:-/sessions/operon-k-5bbbcdfd-548a-a657/.local/PRScs}"
+PRSCS_DIR="${1:-/c4/home/gwendt/.local/PRScs}"
 FILE="$PRSCS_DIR/mcmc_gtb.py"
 
 if [ ! -f "$FILE" ]; then

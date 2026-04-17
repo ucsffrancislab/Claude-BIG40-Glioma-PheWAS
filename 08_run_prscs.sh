@@ -32,7 +32,7 @@
 #SBATCH --job-name=prscs
 #SBATCH --array=1-3935
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
+#SBATCH --mem=16G
 #SBATCH --time=4:00:00
 # NOTE: --output / --error intentionally omitted here — pass them on the
 #       sbatch command line with an absolute LOG_DIR (see Usage above),

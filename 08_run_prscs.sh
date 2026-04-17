@@ -5,7 +5,13 @@
 # SLURM array job: run PRS-CS on all 3,935 BIG40 IDPs for one cohort.
 #
 # Usage:
-#   sbatch 08_run_prscs.sh <cohort> <out_base_dir>
+#   sbatch --export=LOG_DIR=/abs/path/logs/prscs \
+#          08_run_prscs.sh <cohort> <out_base_dir>
+#
+#   LOG_DIR is OPTIONAL (default: <out_base_dir>/logs) but MUST be an
+#   absolute path and MUST exist before sbatch is called — SLURM opens
+#   log files before the script runs, so a missing dir = silent job
+#   failure with no output.
 #
 #   <cohort> may be given with or without the 'imputed-umich-' prefix —
 #   the prefix is stripped for output-path purposes.
@@ -28,8 +34,9 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --time=4:00:00
-#SBATCH --output=logs/prscs/%x_%A_%a.out
-#SBATCH --error=logs/prscs/%x_%A_%a.err
+# NOTE: --output / --error intentionally omitted here — pass them on the
+#       sbatch command line with an absolute LOG_DIR (see Usage above),
+#       otherwise SLURM fails silently if the relative path can't be opened.
 
 set -eu
 
@@ -113,7 +120,7 @@ else
 fi
 
 # ── Run PRS-CS ───────────────────────────────────────────────────────────────
-mkdir -p "$IDP_OUT_DIR" "logs/prscs"
+mkdir -p "$IDP_OUT_DIR"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] PRS-CS  IDP=${IDP}  cohort=${COHORT}  out=${OUT_DIR}"
 

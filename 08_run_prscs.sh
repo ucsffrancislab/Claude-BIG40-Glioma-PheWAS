@@ -73,10 +73,36 @@ if [ ! -d "$SST_DIR" ]; then
     exit 1
 fi
 
+# ── Verify PRS-CS is patched for NumPy 2.x (fail fast, not at write step) ────
+# PRS-CS crashes on NumPy 2.x in 5 places; patch_prscs_numpy2.sh fixes all.
+# Without the patch, the job runs MCMC for ~10 min per chromosome and THEN
+# crashes on the output write — a massive waste of compute at scale.
+MCMC="${PRSCS_PY%/*}/mcmc_gtb.py"
+missing=0
+# grep -F: literal string match, no regex escaping required
+for marker in \
+    "float(np.sum(beta*beta_mrg))" \
+    "float(2.0*delta[jj,0])" \
+    "float(np.sum(delta))" \
+    "beta_est.flatten()" \
+    "psi_est.flatten()"
+do
+    if ! grep -qF -- "$marker" "$MCMC"; then
+        echo "ERROR: PRS-CS NumPy 2.x patch missing marker: $marker" >&2
+        missing=$((missing + 1))
+    fi
+done
+if [ "$missing" -gt 0 ]; then
+    echo "ERROR: PRS-CS at $MCMC is not patched (${missing}/5 markers missing)." >&2
+    echo "       Run: bash patch_prscs_numpy2.sh" >&2
+    exit 1
+fi
+
 # ── Thread control (important for SLURM) ─────────────────────────────────────
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1       # flush PRS-CS print() as it happens
 
 # ── Determine IDP for this array task ────────────────────────────────────────
 IDP=$(printf "%04d" "${SLURM_ARRAY_TASK_ID}")
@@ -124,6 +150,26 @@ mkdir -p "$IDP_OUT_DIR"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] PRS-CS  IDP=${IDP}  cohort=${COHORT}  out=${OUT_DIR}"
 
+# ── Heartbeat: prints status every 5 min even if PRS-CS is silent ────────────
+# Tracks current chromosome via a scratch sentinel file; exits when we touch
+# "done" (at end of main loop) or on any SIGTERM/EXIT.
+HEARTBEAT_STATE="${SCRATCH}/${IDP}.heartbeat_state"
+echo "init" > "$HEARTBEAT_STATE"
+(
+    t_start=$(date +%s)
+    while true; do
+        sleep 300
+        cur=$(cat "$HEARTBEAT_STATE" 2>/dev/null || echo "?")
+        [ "$cur" = "done" ] && break
+        elapsed=$(( $(date +%s) - t_start ))
+        h=$(( elapsed / 3600 )); m=$(( (elapsed % 3600) / 60 ))
+        printf "  [HEARTBEAT %s] chr%s, elapsed %dh%02dm\n" \
+               "$(date '+%H:%M:%S')" "$cur" "$h" "$m"
+    done
+) &
+HEARTBEAT_PID=$!
+trap 'echo done > "$HEARTBEAT_STATE" 2>/dev/null; kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT
+
 for chr in $(seq 1 22); do
     outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
 
@@ -132,12 +178,14 @@ for chr in $(seq 1 22); do
         continue
     fi
 
-    echo "  chr${chr} ... running"
+    echo "$chr" > "$HEARTBEAT_STATE"
+    chr_t0=$(date +%s)
+    echo "  [$(date '+%H:%M:%S')] chr${chr} ... running"
 
     # NOTE: PRS-CS's --out_dir is actually a filename PREFIX, not a directory.
     # It gets concatenated with '_pst_eff_a1_b0.5_phiauto_chr<N>.txt'.
     # So we pass <dir>/<IDP> to produce <dir>/<IDP>_pst_eff_..._chr<N>.txt.
-    python3 "$PRSCS_PY" \
+    python3 -u "$PRSCS_PY" \
         --ref_dir="$LD_REF" \
         --bim_prefix="$BIM_PREFIX" \
         --sst_file="$SST_FILE" \
@@ -145,13 +193,21 @@ for chr in $(seq 1 22); do
         --chrom="$chr" \
         --out_dir="${IDP_OUT_DIR}/${IDP}"
 
+    chr_elapsed=$(( $(date +%s) - chr_t0 ))
     if [ -f "$outfile" ]; then
         chmod a-w "$outfile"
-        echo "  chr${chr} ... OK"
+        printf "  [%s] chr%s ... OK  (%dm%02ds)\n" \
+               "$(date '+%H:%M:%S')" "$chr" \
+               $(( chr_elapsed / 60 )) $(( chr_elapsed % 60 ))
     else
-        echo "  chr${chr} ... FAIL (no output)"
+        echo "  [$(date '+%H:%M:%S')] chr${chr} ... FAIL (no output)"
     fi
 done
+
+# Tell heartbeat to exit cleanly (EXIT trap also handles abnormal termination)
+echo done > "$HEARTBEAT_STATE"
+kill "$HEARTBEAT_PID" 2>/dev/null || true
+wait "$HEARTBEAT_PID" 2>/dev/null || true
 
 # ── Clean up scratch (belt-and-braces; $TMPDIR is auto-removed) ──────────────
 if [ "$SST_IS_GZ" -eq 1 ] && [ -f "$SST_FILE" ]; then
@@ -161,3 +217,4 @@ fi
 # ── Verify ───────────────────────────────────────────────────────────────────
 n_done=$(find "$IDP_OUT_DIR" -name "${IDP}_pst_eff_*_chr*.txt" ! -writable 2>/dev/null | wc -l)
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] IDP ${IDP} ${COHORT}: ${n_done}/22 chromosomes complete"
+

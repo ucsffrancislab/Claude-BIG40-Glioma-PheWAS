@@ -4,15 +4,19 @@
 #
 # Patch a local PRS-CS install for NumPy 2.x compatibility.
 #
-# Root cause: PRS-CS uses Python's built-in sum() on 2-D numpy arrays,
-# which iterates along axis 0 and returns 1-D arrays instead of scalars.
-# This propagates through err -> sigma -> gigrnd call site. In NumPy 2.x,
-# float(1-D-array) raises TypeError; older NumPy silently unboxed.
+# Root cause: PRS-CS uses 2-D column-vector arrays (shape (p,1)) and relies on
+# Python's built-in sum() + implicit scalar conversion to unbox 1-element
+# ndarrays. NumPy 2.x made float(1-D-array) and "%d"/"%e" % 1-D-array into
+# hard errors. We fix the four places where this leaks out.
 #
-# Fixes three lines in mcmc_gtb.py:
-#   L66: err = max(...)              -- replace sum() with np.sum(), cast to float
-#   L72: psi[jj] = gigrnd.gigrnd(...) -- index 2-D arrays as [jj,0], cast to float
-#   L77: phi = random.gamma(...)     -- replace sum() with np.sum()
+# Fixes in mcmc_gtb.py:
+#   L66: err = max(...)            -- sum() -> np.sum(), cast to float
+#   L72: psi[jj] = gigrnd(...)     -- index 2-D arrays as [jj,0], cast to float
+#   L77: phi = random.gamma(...)   -- sum(delta) -> float(np.sum(delta))
+#   L110: write loop for beta_est  -- zip over beta_est.flatten() so each
+#                                     element yielded is a numpy scalar
+#   L120: write loop for psi_est   -- zip over psi_est.flatten() (symmetry;
+#                                     matters only if --write_psi=TRUE)
 #
 # Idempotent and self-healing:
 #   - On first run, backs up original as mcmc_gtb.py.bak (immutable thereafter).
@@ -48,20 +52,30 @@ fp = sys.argv[1]
 s = open(fp).read()
 
 subs = [
-    # Fix 1: err line -- use np.sum, cast to scalar
+    # Fix 1: err line
     (
         "        err = max(n/2.0*(1.0-2.0*sum(beta*beta_mrg)+quad), n/2.0*sum(beta**2/psi))",
         "        err = float(max(n/2.0*(1.0-2.0*float(np.sum(beta*beta_mrg))+float(np.sum(quad))), n/2.0*float(np.sum(beta**2/psi))))",
     ),
-    # Fix 2: gigrnd call site -- 2-D index and float cast
+    # Fix 2: gigrnd call site
     (
         "            psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)",
         "            psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))",
     ),
-    # Fix 3: phi update -- np.sum instead of Python sum
+    # Fix 3: phi update
     (
         "            phi = random.gamma(p*b+0.5, 1.0/(sum(delta)+w))",
         "            phi = random.gamma(p*b+0.5, 1.0/(float(np.sum(delta))+w))",
+    ),
+    # Fix 4: write beta_est (default output path)
+    (
+        "            for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_est):",
+        "            for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_est.flatten()):",
+    ),
+    # Fix 5: write psi_est (only if write_psi=TRUE)
+    (
+        "            for snp, psi in zip(sst_dict['SNP'], psi_est):",
+        "            for snp, psi in zip(sst_dict['SNP'], psi_est.flatten()):",
     ),
 ]
 
@@ -73,7 +87,7 @@ for old, new in subs:
     s = s.replace(old, new, 1)
 
 open(fp, "w").write(s)
-print(f"applied 3 fixes to {fp}")
+print(f"applied 5 fixes to {fp}")
 PYEOF
 
 echo "patched: $FILE"

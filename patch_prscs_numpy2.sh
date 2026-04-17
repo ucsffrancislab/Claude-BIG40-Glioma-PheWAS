@@ -4,16 +4,20 @@
 #
 # Patch a local PRS-CS install for NumPy 2.x compatibility.
 #
-# Two fixes in mcmc_gtb.py:
-#   (1) gigrnd call site: index 2-D arrays as [jj,0] and cast to float
-#       (fixes "float(b)" error in gigrnd.py line 38)
-#   (2) sigma: cast to float after computation, because the preceding
-#       err computation uses Python's built-in sum() on 2-D arrays which
-#       returns 1-D results, making sigma a (1,) array that propagates
-#       through n*beta[jj,0]**2/sigma.
+# Root cause: PRS-CS uses Python's built-in sum() on 2-D numpy arrays,
+# which iterates along axis 0 and returns 1-D arrays instead of scalars.
+# This propagates through err -> sigma -> gigrnd call site. In NumPy 2.x,
+# float(1-D-array) raises TypeError; older NumPy silently unboxed.
 #
-# Idempotent. Backs up the original as mcmc_gtb.py.bak (first run only;
-# re-running does not overwrite the .bak).
+# Fixes three lines in mcmc_gtb.py:
+#   L66: err = max(...)              -- replace sum() with np.sum(), cast to float
+#   L72: psi[jj] = gigrnd.gigrnd(...) -- index 2-D arrays as [jj,0], cast to float
+#   L77: phi = random.gamma(...)     -- replace sum() with np.sum()
+#
+# Idempotent and self-healing:
+#   - On first run, backs up original as mcmc_gtb.py.bak (immutable thereafter).
+#   - On every run, restores from .bak before patching, so partial prior
+#     patches are cleanly replaced with the full current fix.
 #
 # Usage:
 #   bash patch_prscs_numpy2.sh [PRSCS_DIR]
@@ -29,19 +33,14 @@ if [ ! -f "$FILE" ]; then
     exit 1
 fi
 
-# Backup once (preserve the truly-original)
+# Create immutable backup on first run
 if [ ! -f "${FILE}.bak" ]; then
     cp "$FILE" "${FILE}.bak"
     echo "backup created: ${FILE}.bak"
 fi
 
-# --- Fix 1: gigrnd call site ---
-OLD1='psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)'
-NEW1='psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))'
-
-# --- Fix 2: sigma scalar cast ---
-OLD2='sigma = 1.0/random.gamma((n+p)/2.0, 1.0/err)'
-NEW2='sigma = float(1.0/random.gamma((n+p)/2.0, 1.0/err))'
+# Always restore from backup so we start from a known clean state
+cp "${FILE}.bak" "$FILE"
 
 python3 - "$FILE" <<'PYEOF'
 import sys
@@ -49,26 +48,33 @@ fp = sys.argv[1]
 s = open(fp).read()
 
 subs = [
-    ("psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)",
-     "psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))"),
-    ("sigma = 1.0/random.gamma((n+p)/2.0, 1.0/err)",
-     "sigma = float(1.0/random.gamma((n+p)/2.0, 1.0/err))"),
+    # Fix 1: err line -- use np.sum, cast to scalar
+    (
+        "        err = max(n/2.0*(1.0-2.0*sum(beta*beta_mrg)+quad), n/2.0*sum(beta**2/psi))",
+        "        err = float(max(n/2.0*(1.0-2.0*float(np.sum(beta*beta_mrg))+float(np.sum(quad))), n/2.0*float(np.sum(beta**2/psi))))",
+    ),
+    # Fix 2: gigrnd call site -- 2-D index and float cast
+    (
+        "            psi[jj] = gigrnd.gigrnd(a-0.5, 2.0*delta[jj], n*beta[jj]**2/sigma)",
+        "            psi[jj] = gigrnd.gigrnd(a-0.5, float(2.0*delta[jj,0]), float(n*beta[jj,0]**2/sigma))",
+    ),
+    # Fix 3: phi update -- np.sum instead of Python sum
+    (
+        "            phi = random.gamma(p*b+0.5, 1.0/(sum(delta)+w))",
+        "            phi = random.gamma(p*b+0.5, 1.0/(float(np.sum(delta))+w))",
+    ),
 ]
 
-changes = 0
-already = 0
 for old, new in subs:
-    if new in s:
-        already += 1
-        continue
     if old not in s:
-        print(f"ERROR: expected pattern not found: {old!r}", file=sys.stderr)
+        print(f"ERROR: pattern not found (unexpected upstream change?):", file=sys.stderr)
+        print(f"  looking for: {old!r}", file=sys.stderr)
         sys.exit(1)
-    s = s.replace(old, new)
-    changes += 1
+    s = s.replace(old, new, 1)
 
 open(fp, "w").write(s)
-print(f"applied {changes} new change(s); {already} already in place")
+print(f"applied 3 fixes to {fp}")
 PYEOF
 
 echo "patched: $FILE"
+echo "backup:  ${FILE}.bak"

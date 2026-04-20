@@ -1,44 +1,45 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 08_run_prscs.sh
+# 08_run_prscs.sh  (v8 — single big job, xargs parallelism, full resume)
 #
-# SLURM array job: run PRS-CS on all 3,935 BIG40 IDPs for one cohort.
+# One SLURM job per cohort. Internally runs N_WORKERS concurrent PRS-CS
+# invocations via xargs -P. Each invocation processes one IDP, all 22
+# chromosomes in a single python call (amortizes sumstats/BIM parsing).
 #
 # Usage:
-#   sbatch --export=LOG_DIR=/abs/path/logs/prscs \
-#          08_run_prscs.sh <cohort> <out_base_dir>
-#
-#   LOG_DIR is OPTIONAL (default: <out_base_dir>/logs) but MUST be an
-#   absolute path and MUST exist before sbatch is called — SLURM opens
-#   log files before the script runs, so a missing dir = silent job
-#   failure with no output.
-#
-#   <cohort> may be given with or without the 'imputed-umich-' prefix —
-#   the prefix is stripped for output-path purposes.
+#   sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]
 #
 # Examples:
-#   sbatch 08_run_prscs.sh cidr /francislab/data1/working/BIG40/prscs_output
-#   sbatch 08_run_prscs.sh imputed-umich-i370 /francislab/data1/working/BIG40/prscs_output
+#   sbatch 08_run_prscs.sh /francislab/data1/working/BIG40/prscs_output cidr
+#   sbatch 08_run_prscs.sh /francislab/data1/working/BIG40/prscs_output i370 1 2000
 #
-# Each array task = one IDP, looping chr1-22 internally.
-# Outputs are write-protected on success so reruns skip completed chromosomes.
+# Crash / timeout recovery:
+#   - Output files chmod a-w on successful completion
+#   - Worker skips any IDP whose 22 outputs are all write-protected
+#   - Partial IDPs: worker runs only the missing chromosomes
+#   - flock-based atomic claim prevents concurrent workers (or jobs) from
+#     double-running the same IDP; locks auto-release on process death (even
+#     SIGKILL) because the kernel drops fd-backed locks
 #
-# Inputs (NOT VCFs — VCFs are used only in step 09 for scoring):
-#   - Per-cohort BIM  : ${BIM_DIR}/<cohort>.bim  (w/ or w/o imputed-umich- prefix)
-#   - Summary stats   : ${SST_DIR}/<IDP>.txt[.gz]
-#   - LD reference    : ${LD_REF}/
+# Resubmit to resume: same command line, no flags — it just picks up.
 # =============================================================================
 
 #SBATCH --job-name=prscs
-#SBATCH --array=1-3935
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=16G
-#SBATCH --time=4:00:00
-# NOTE: --output / --error intentionally omitted here — pass them on the
-#       sbatch command line with an absolute LOG_DIR (see Usage above),
-#       otherwise SLURM fails silently if the relative path can't be opened.
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=480G
+#SBATCH --time=14-00:00:00
+# NOTE: --output / --error intentionally omitted; pass on sbatch CLI with an
+#       absolute LOG_DIR path that already exists.
 
 set -eu
+
+# ── CLI arguments ────────────────────────────────────────────────────────────
+OUT_BASE="${1:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]}"
+COHORT_RAW="${2:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]}"
+START_IDP="${3:-1}"
+END_IDP="${4:-3935}"
+
+COHORT="${COHORT_RAW#imputed-umich-}"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 PRSCS_PY="${HOME}/.local/PRScs/PRScs.py"
@@ -47,39 +48,21 @@ SST_DIR="/francislab/data1/refs/BIG40/prscs_input"
 BIM_DIR="/francislab/data1/refs/BIG40/target_bim"
 N_GWAS=33224
 
-# ── CLI arguments ────────────────────────────────────────────────────────────
-COHORT_RAW="${1:?Usage: sbatch 08_run_prscs.sh <cohort> <out_base_dir>}"
-OUT_BASE="${2:?Usage: sbatch 08_run_prscs.sh <cohort> <out_base_dir>}"
+# Number of parallel workers. Default 32 (~15GB/worker on 490GB node).
+# Override via env var, e.g.:  sbatch --export=ALL,N_WORKERS=40 08_run_prscs.sh ...
+N_WORKERS="${N_WORKERS:-32}"
 
-# Strip 'imputed-umich-' prefix so it doesn't pollute output paths
-COHORT="${COHORT_RAW#imputed-umich-}"
-
-# Locate BIM: try clean name first, then with prefix
-if   [ -f "${BIM_DIR}/${COHORT}.bim" ]; then
-    BIM_PREFIX="${BIM_DIR}/${COHORT}"
-elif [ -f "${BIM_DIR}/imputed-umich-${COHORT}.bim" ]; then
-    BIM_PREFIX="${BIM_DIR}/imputed-umich-${COHORT}"
+# Locate BIM (with or without imputed-umich- prefix)
+if   [ -f "${BIM_DIR}/${COHORT}.bim" ];                 then BIM_PREFIX="${BIM_DIR}/${COHORT}"
+elif [ -f "${BIM_DIR}/imputed-umich-${COHORT}.bim" ];   then BIM_PREFIX="${BIM_DIR}/imputed-umich-${COHORT}"
 else
-    echo "ERROR: BIM not found for cohort '${COHORT}'. Tried:"
-    echo "  ${BIM_DIR}/${COHORT}.bim"
-    echo "  ${BIM_DIR}/imputed-umich-${COHORT}.bim"
+    echo "ERROR: BIM not found for cohort '${COHORT}' in $BIM_DIR" >&2
     exit 1
 fi
 
-OUT_DIR="${OUT_BASE}/${COHORT}"
-
-if [ ! -d "$SST_DIR" ]; then
-    echo "ERROR: Summary stats dir not found: $SST_DIR"
-    exit 1
-fi
-
-# ── Verify PRS-CS is patched for NumPy 2.x (fail fast, not at write step) ────
-# PRS-CS crashes on NumPy 2.x in 5 places; patch_prscs_numpy2.sh fixes all.
-# Without the patch, the job runs MCMC for ~10 min per chromosome and THEN
-# crashes on the output write — a massive waste of compute at scale.
-MCMC="${PRSCS_PY%/*}/mcmc_gtb.py"
+# ── Pre-flight: verify PRS-CS NumPy 2.x patch is applied ─────────────────────
+MCMC_PY="${PRSCS_PY%/*}/mcmc_gtb.py"
 missing=0
-# grep -F: literal string match, no regex escaping required
 for marker in \
     "float(np.sum(beta*beta_mrg))" \
     "float(2.0*delta[jj,0])" \
@@ -87,134 +70,160 @@ for marker in \
     "beta_est.flatten()" \
     "psi_est.flatten()"
 do
-    if ! grep -qF -- "$marker" "$MCMC"; then
+    if ! grep -qF -- "$marker" "$MCMC_PY"; then
         echo "ERROR: PRS-CS NumPy 2.x patch missing marker: $marker" >&2
         missing=$((missing + 1))
     fi
 done
 if [ "$missing" -gt 0 ]; then
-    echo "ERROR: PRS-CS at $MCMC is not patched (${missing}/5 markers missing)." >&2
+    echo "ERROR: PRS-CS at $MCMC_PY is not patched (${missing}/5 markers missing)." >&2
     echo "       Run: bash patch_prscs_numpy2.sh" >&2
     exit 1
 fi
 
-# ── Thread control (important for SLURM) ─────────────────────────────────────
+# ── Paths / setup ────────────────────────────────────────────────────────────
+COHORT_OUT="${OUT_BASE}/${COHORT}"
+LOCK_DIR="${OUT_BASE}/.locks/${COHORT}"
+WORKER_LOG_DIR="${OUT_BASE}/logs/workers/${COHORT}/${SLURM_JOB_ID:-local}"
+mkdir -p "$COHORT_OUT" "$LOCK_DIR" "$WORKER_LOG_DIR"
+
+# ── Threading control (each worker = 1 thread; we parallelize across workers) ─
 export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export OMP_NUM_THREADS=1
-export PYTHONUNBUFFERED=1       # flush PRS-CS print() as it happens
+export PYTHONUNBUFFERED=1
 
-# ── Determine IDP for this array task ────────────────────────────────────────
-IDP=$(printf "%04d" "${SLURM_ARRAY_TASK_ID}")
-IDP_OUT_DIR="${OUT_DIR}/${IDP}"
+# Export everything worker subshells need
+export COHORT BIM_PREFIX PRSCS_PY LD_REF SST_DIR COHORT_OUT LOCK_DIR
+export WORKER_LOG_DIR N_GWAS
 
-# Locate summary stats (accept .txt or .txt.gz)
-if   [ -f "${SST_DIR}/${IDP}.txt.gz" ]; then
-    SST_SRC="${SST_DIR}/${IDP}.txt.gz"
-    SST_IS_GZ=1
-elif [ -f "${SST_DIR}/${IDP}.txt" ]; then
-    SST_SRC="${SST_DIR}/${IDP}.txt"
-    SST_IS_GZ=0
-else
-    echo "SKIP  IDP ${IDP}  (no summary stats — gap in numbering)"
-    exit 0
-fi
+# ── Worker function ──────────────────────────────────────────────────────────
+# One call = one IDP. All 22 chrs in a single python invocation (only missing
+# chrs if resuming). flock-claims the IDP so multiple workers/jobs can't double-
+# run it. Writes to a per-IDP log file.
+process_idp() {
+    local idp="$1"
+    local idp_out_dir="${COHORT_OUT}/${idp}"
+    local log_file="${WORKER_LOG_DIR}/${idp}.log"
+    local lock_file="${LOCK_DIR}/${idp}.lock"
 
-# Check if already complete (all 22 chromosome outputs write-protected)
-n_complete=0
-for chr in $(seq 1 22); do
-    outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
-    if [ -f "$outfile" ] && [ ! -w "$outfile" ]; then
-        n_complete=$((n_complete + 1))
-    fi
-done
+    mkdir -p "$idp_out_dir"
 
-if [ "$n_complete" -eq 22 ]; then
-    echo "SKIP  IDP ${IDP} ${COHORT}  (all 22 chromosomes complete)"
-    exit 0
-fi
+    # All output/logging inside the flock guard so concurrent attempts are silent
+    (
+        # fd 9 → lock file; non-blocking try-lock, exit silently if held
+        exec 9>"$lock_file"
+        flock -n 9 || exit 0
 
-# ── Decompress to node-local scratch if gzipped ──────────────────────────────
-# PRS-CS opens the sst file with plain open() (twice) — no native gzip support.
-# $TMPDIR is SLURM's per-job local scratch, auto-cleaned at job exit.
-SCRATCH="${TMPDIR:-/tmp}"
-if [ "$SST_IS_GZ" -eq 1 ]; then
-    SST_FILE="${SCRATCH}/${IDP}.txt"
-    zcat "$SST_SRC" > "$SST_FILE"
-else
-    SST_FILE="$SST_SRC"
-fi
+        {
+            # ── Determine which chrs still need work ─────────────────────────
+            local needed=()
+            for chr in $(seq 1 22); do
+                local outfile="${idp_out_dir}/${idp}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
+                if [ -f "$outfile" ] && [ ! -w "$outfile" ]; then
+                    continue                       # finished, protected
+                fi
+                if [ -f "$outfile" ] && [ -w "$outfile" ]; then
+                    rm -f "$outfile"               # stale partial from a crash
+                fi
+                needed+=("$chr")
+            done
 
-# ── Run PRS-CS ───────────────────────────────────────────────────────────────
-mkdir -p "$IDP_OUT_DIR"
+            if [ ${#needed[@]} -eq 0 ]; then
+                echo "[$(date '+%F %T')] SKIP ${COHORT}/${idp} (all 22 chrs complete)"
+                exit 0
+            fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] PRS-CS  IDP=${IDP}  cohort=${COHORT}  out=${OUT_DIR}"
+            # ── Locate sumstats ──────────────────────────────────────────────
+            local sst_src sst_file
+            if   [ -f "${SST_DIR}/${idp}.txt.gz" ]; then
+                sst_src="${SST_DIR}/${idp}.txt.gz"
+                sst_file="${TMPDIR:-/tmp}/${idp}_$$.txt"
+                zcat "$sst_src" > "$sst_file"
+            elif [ -f "${SST_DIR}/${idp}.txt" ]; then
+                sst_src=""
+                sst_file="${SST_DIR}/${idp}.txt"
+            else
+                echo "[$(date '+%F %T')] MISS ${COHORT}/${idp} (no sumstats — numbering gap)"
+                exit 0
+            fi
 
-# ── Heartbeat: prints status every 5 min even if PRS-CS is silent ────────────
-# Tracks current chromosome via a scratch sentinel file; exits when we touch
-# "done" (at end of main loop) or on any SIGTERM/EXIT.
-HEARTBEAT_STATE="${SCRATCH}/${IDP}.heartbeat_state"
-echo "init" > "$HEARTBEAT_STATE"
+            # ── Run PRS-CS (single invocation for all needed chrs) ───────────
+            local chrom_arg
+            chrom_arg=$(IFS=,; echo "${needed[*]}")
+            local n_needed=${#needed[@]}
+
+            echo "[$(date '+%F %T')] START ${COHORT}/${idp} (${n_needed} chrs: ${chrom_arg})"
+            local t0=$(date +%s)
+            local prscs_rc=0
+
+            python3 -u "$PRSCS_PY" \
+                --ref_dir="$LD_REF" \
+                --bim_prefix="$BIM_PREFIX" \
+                --sst_file="$sst_file" \
+                --n_gwas="$N_GWAS" \
+                --chrom="$chrom_arg" \
+                --out_dir="${idp_out_dir}/${idp}" \
+                || prscs_rc=$?
+
+            local t_elapsed=$(( $(date +%s) - t0 ))
+
+            # Cleanup scratch sumstats (if we decompressed)
+            [ -n "$sst_src" ] && rm -f "$sst_file" 2>/dev/null || true
+
+            # ── Write-protect each successful output ─────────────────────────
+            local n_ok=0
+            for chr in "${needed[@]}"; do
+                local outfile="${idp_out_dir}/${idp}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
+                if [ -f "$outfile" ]; then
+                    chmod a-w "$outfile"
+                    n_ok=$((n_ok + 1))
+                fi
+            done
+
+            if [ "$n_ok" -eq "$n_needed" ]; then
+                printf "[%s] DONE  %s/%s (%d chrs, %dh%02dm)\n" \
+                       "$(date '+%F %T')" "$COHORT" "$idp" "$n_ok" \
+                       $((t_elapsed / 3600)) $(((t_elapsed % 3600) / 60))
+            else
+                printf "[%s] FAIL  %s/%s (%d/%d chrs, rc=%d)\n" \
+                       "$(date '+%F %T')" "$COHORT" "$idp" "$n_ok" \
+                       "$n_needed" "$prscs_rc"
+                exit 1
+            fi
+        } >>"$log_file" 2>&1
+    )
+    # flock auto-releases on subshell exit (even SIGKILL)
+}
+export -f process_idp
+
+# ── Master heartbeat (every 5 min: overall progress) ─────────────────────────
 (
     t_start=$(date +%s)
     while true; do
         sleep 300
-        cur=$(cat "$HEARTBEAT_STATE" 2>/dev/null || echo "?")
-        [ "$cur" = "done" ] && break
         elapsed=$(( $(date +%s) - t_start ))
         h=$(( elapsed / 3600 )); m=$(( (elapsed % 3600) / 60 ))
-        printf "  [HEARTBEAT %s] chr%s, elapsed %dh%02dm\n" \
-               "$(date '+%H:%M:%S')" "$cur" "$h" "$m"
+        # Count IDPs with chr22 output write-protected (i.e. fully done)
+        n_done=$(find "$COHORT_OUT" -name '*_pst_eff_*_chr22.txt' ! -writable 2>/dev/null | wc -l)
+        # Active workers = flock-held lock files
+        n_active=$(find "$LOCK_DIR" -name '*.lock' 2>/dev/null | wc -l)
+        printf "[HEARTBEAT %s] elapsed %dh%02dm  done=%d  locks_held=%d\n" \
+               "$(date '+%H:%M:%S')" "$h" "$m" "$n_done" "$n_active"
     done
 ) &
 HEARTBEAT_PID=$!
-trap 'echo done > "$HEARTBEAT_STATE" 2>/dev/null; kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT
+trap 'kill $HEARTBEAT_PID 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
-for chr in $(seq 1 22); do
-    outfile="${IDP_OUT_DIR}/${IDP}_pst_eff_a1_b0.5_phiauto_chr${chr}.txt"
+# ── Dispatch IDPs to worker pool ─────────────────────────────────────────────
+echo "[$(date '+%F %T')] START cohort=${COHORT}  idps=${START_IDP}..${END_IDP}  workers=${N_WORKERS}"
+echo "[$(date '+%F %T')]   out=${COHORT_OUT}"
+echo "[$(date '+%F %T')]   worker_logs=${WORKER_LOG_DIR}"
 
-    if [ -f "$outfile" ] && [ ! -w "$outfile" ]; then
-        echo "  chr${chr} ... SKIP"
-        continue
-    fi
+seq -f "%04.0f" "$START_IDP" "$END_IDP" |
+    xargs -P "$N_WORKERS" -I '{}' bash -c 'process_idp "$1"' _ '{}'
 
-    echo "$chr" > "$HEARTBEAT_STATE"
-    chr_t0=$(date +%s)
-    echo "  [$(date '+%H:%M:%S')] chr${chr} ... running"
-
-    # NOTE: PRS-CS's --out_dir is actually a filename PREFIX, not a directory.
-    # It gets concatenated with '_pst_eff_a1_b0.5_phiauto_chr<N>.txt'.
-    # So we pass <dir>/<IDP> to produce <dir>/<IDP>_pst_eff_..._chr<N>.txt.
-    python3 -u "$PRSCS_PY" \
-        --ref_dir="$LD_REF" \
-        --bim_prefix="$BIM_PREFIX" \
-        --sst_file="$SST_FILE" \
-        --n_gwas="$N_GWAS" \
-        --chrom="$chr" \
-        --out_dir="${IDP_OUT_DIR}/${IDP}"
-
-    chr_elapsed=$(( $(date +%s) - chr_t0 ))
-    if [ -f "$outfile" ]; then
-        chmod a-w "$outfile"
-        printf "  [%s] chr%s ... OK  (%dm%02ds)\n" \
-               "$(date '+%H:%M:%S')" "$chr" \
-               $(( chr_elapsed / 60 )) $(( chr_elapsed % 60 ))
-    else
-        echo "  [$(date '+%H:%M:%S')] chr${chr} ... FAIL (no output)"
-    fi
-done
-
-# Tell heartbeat to exit cleanly (EXIT trap also handles abnormal termination)
-echo done > "$HEARTBEAT_STATE"
-kill "$HEARTBEAT_PID" 2>/dev/null || true
-wait "$HEARTBEAT_PID" 2>/dev/null || true
-
-# ── Clean up scratch (belt-and-braces; $TMPDIR is auto-removed) ──────────────
-if [ "$SST_IS_GZ" -eq 1 ] && [ -f "$SST_FILE" ]; then
-    rm -f "$SST_FILE"
-fi
-
-# ── Verify ───────────────────────────────────────────────────────────────────
-n_done=$(find "$IDP_OUT_DIR" -name "${IDP}_pst_eff_*_chr*.txt" ! -writable 2>/dev/null | wc -l)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] IDP ${IDP} ${COHORT}: ${n_done}/22 chromosomes complete"
-
+# ── Final verify ─────────────────────────────────────────────────────────────
+n_complete=$(find "$COHORT_OUT" -name '*_pst_eff_*_chr22.txt' ! -writable 2>/dev/null | wc -l)
+echo "[$(date '+%F %T')] FINISH cohort=${COHORT}  fully_complete=${n_complete}/$((END_IDP - START_IDP + 1))"

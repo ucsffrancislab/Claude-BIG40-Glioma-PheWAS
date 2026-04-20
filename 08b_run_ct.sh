@@ -6,14 +6,14 @@
 # then score all 4 cohorts. Minutes per IDP instead of hours.
 #
 # Usage:
-#   sbatch 08b_run_ct.sh <eur_ref_prefix> <out_base>
+#   sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [end_idp]
 #
 # Examples:
-#   sbatch 08b_run_ct.sh /path/to/EUR /francislab/data1/working/BIG40/ct_output
-#   sbatch --export=ALL,N_WORKERS=48 08b_run_ct.sh /path/to/EUR /path/to/ct_output
+#   sbatch 08b_run_ct.sh /path/to/input /francislab/data1/working/BIG40/ct_output
+#   sbatch 08b_run_ct.sh /path/to/input /path/to/ct_output 1 2126
 #
-# <eur_ref_prefix> is the plink fileset prefix for the 1000G EUR panel
-# (expects EUR.bed, EUR.bim, EUR.fam at that prefix).
+# <input_dir> contains the target genotype plink filesets:
+#   imputed-umich-{cidr,i370,onco,tcga}.{bed,bim,fam}
 #
 # Crash / timeout recovery:
 #   - Score files are chmod a-w on success
@@ -23,19 +23,23 @@
 # =============================================================================
 
 #SBATCH --job-name=ct_pgs
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=480G
-#SBATCH --time=1-00:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=240G
+#SBATCH --time=14-0
+#SBATCH --mail-type=FAIL
+#SBATCH --export=None
 
 set -eu
 
 # ── CLI arguments ────────────────────────────────────────────────────────────
-EUR_REF="${1:?Usage: sbatch 08b_run_ct.sh <eur_ref_prefix> <out_base> [start_idp] [end_idp]}"
-OUT_BASE="${2:?Usage: sbatch 08b_run_ct.sh <eur_ref_prefix> <out_base> [start_idp] [end_idp]}"
+INPUT_DIR="${1:?Usage: sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [end_idp]}"
+OUT_BASE="${2:?Usage: sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [end_idp]}"
 
 # ── Configuration ────────────────────────────────────────────────────────────
+EUR_REF="/francislab/data1/refs/sources/fileserve.mrcieu.ac.uk/ld/EUR"
 SST_DIR="/francislab/data1/refs/BIG40/prscs_input"
-INPUT_DIR="/francislab/data1/refs/BIG40/input"
 BIM_DIR="/francislab/data1/refs/BIG40/target_bim"
 COHORTS="cidr i370 onco tcga"
 N_GWAS=33224

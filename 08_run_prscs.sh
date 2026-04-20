@@ -25,11 +25,13 @@
 # =============================================================================
 
 #SBATCH --job-name=prscs
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=480G
-#SBATCH --time=14-00:00:00
-# NOTE: --output / --error intentionally omitted; pass on sbatch CLI with an
-#       absolute LOG_DIR path that already exists.
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=240G
+#SBATCH --time=14-0
+#SBATCH --mail-type=FAIL
+#SBATCH --export=None
 
 set -eu
 
@@ -48,8 +50,7 @@ SST_DIR="/francislab/data1/refs/BIG40/prscs_input"
 BIM_DIR="/francislab/data1/refs/BIG40/target_bim"
 N_GWAS=33224
 
-# Number of parallel workers. Default 32 (~15GB/worker on 490GB node).
-# Override via env var, e.g.:  sbatch --export=ALL,N_WORKERS=40 08_run_prscs.sh ...
+# Number of parallel workers (edit here to change; --export=None blocks env overrides)
 N_WORKERS="${N_WORKERS:-32}"
 
 # Locate BIM (with or without imputed-umich- prefix)

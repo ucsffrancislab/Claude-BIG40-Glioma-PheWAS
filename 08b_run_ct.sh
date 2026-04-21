@@ -212,8 +212,9 @@ process_idp() {
             if [ "$any_scored" -eq 1 ]; then
                 # Sum SCORE1_SUM across chromosomes per individual
                 # plink2 .sscore cols: #FID IID ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_SUM
+                # plink2 VCF .sscore cols: #IID ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_SUM
                 awk 'FNR==1 && NR==FNR{print; next} FNR==1{next}
-                     {key=$1"\t"$2; act[key]+=$3; dos[key]+=$4; score[key]+=$5}
+                     {iid=$1; act[iid]+=$2; dos[iid]+=$3; score[iid]+=$4}
                      END{for(k in score) print k"\t"act[k]"\t"dos[k]"\t"score[k]}' \
                     OFS='\t' "${chr_prefix}"_chr*.sscore > "$scorefile"
                 chmod a-w "$scorefile"

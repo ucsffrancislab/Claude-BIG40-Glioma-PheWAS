@@ -51,7 +51,7 @@ BIM_DIR="/francislab/data1/refs/BIG40/target_bim"
 N_GWAS=33224
 
 # Number of parallel workers (edit here to change; --export=None blocks env overrides)
-N_WORKERS="${N_WORKERS:-32}"
+N_WORKERS="${SLURM_CPUS_PER_TASK:-32}"
 
 # Locate BIM (with or without imputed-umich- prefix)
 if   [ -f "${BIM_DIR}/${COHORT}.bim" ];                 then BIM_PREFIX="${BIM_DIR}/${COHORT}"

@@ -44,7 +44,7 @@ COHORTS="cidr i370 onco tcga"
 N_GWAS=33224
 START_IDP="${3:-${START_IDP:-1}}"
 END_IDP="${4:-${END_IDP:-3935}}"
-N_WORKERS="${N_WORKERS:-32}"
+N_WORKERS="${SLURM_CPUS_PER_TASK:-32}"
 
 # C+T parameters
 CLUMP_P1="${CLUMP_P1:-1}"        # p-value threshold (1 = keep all SNPs)

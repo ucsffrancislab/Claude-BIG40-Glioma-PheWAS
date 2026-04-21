@@ -53,6 +53,8 @@ CLUMP_KB="${CLUMP_KB:-250}"      # clumping window in kb
 
 # ── Load required modules ────────────────────────────────────────────────────
 module load plink 2>/dev/null || true
+module load plink2 2>/dev/null || true
+module load plink2 2>/dev/null || true
 
 # ── Validate inputs ──────────────────────────────────────────────────────────
 if [ ! -f "${EUR_REF}.bed" ]; then
@@ -78,16 +80,17 @@ mkdir -p "$CLUMP_DIR" "$LOG_DIR" "$SCRATCH"
 
 # ── Pre-filter: extract EUR SNP list + rsID→chr:pos map (once) ────────────────
 EUR_SNPS="${OUT_BASE}/.eur_snps.txt"
-RSID_MAP="${OUT_BASE}/.rsid_to_chrpos.txt"
+RSID_MAP="${OUT_BASE}/.rsid_to_chrpos_refalt.txt"
 if [ ! -f "$EUR_SNPS" ]; then
     awk '{print $2}' "${EUR_REF}.bim" > "${EUR_SNPS}.tmp"
     mv "${EUR_SNPS}.tmp" "$EUR_SNPS"
     echo "[$(date '+%F %T')] EUR SNP list: $(wc -l < "$EUR_SNPS") SNPs"
 fi
 if [ ! -f "$RSID_MAP" ]; then
-    awk '{OFS="\t"; print $2, $1":"$4}' "${EUR_REF}.bim" > "${RSID_MAP}.tmp"
+    # chr:pos:ref:alt — unique even for multiallelic sites
+    awk '{OFS="\t"; print $2, $1":"$4":"$6":"$5}' "${EUR_REF}.bim" > "${RSID_MAP}.tmp"
     mv "${RSID_MAP}.tmp" "$RSID_MAP"
-    echo "[$(date '+%F %T')] rsID-to-chr:pos map: $(wc -l < "$RSID_MAP") entries"
+    echo "[$(date '+%F %T')] rsID-to-chr:pos:ref:alt map: $(wc -l < "$RSID_MAP") entries"
 fi
 
 # ── Worker function ──────────────────────────────────────────────────────────
@@ -193,32 +196,32 @@ process_idp() {
                 local vcf="${INPUT_DIR}/imputed-umich-${cohort}/chr${chr}.dose.vcf.gz"
                 [ ! -f "$vcf" ] && continue
 
-                plink --vcf "$vcf" \
-                      --extract "$chrpos_snps" \
-                      --score "$chrpos_sst" 1 2 4 header sum \
-                      --out "${chr_prefix}_chr${chr}" \
-                      --threads 1 \
-                      --memory 4000 \
-                      > /dev/null 2>&1
+                plink2 --vcf "$vcf" dosage=DS \
+                       --set-all-var-ids @:#:\$r:\$a \
+                       --extract "$chrpos_snps" \
+                       --score "$chrpos_sst" 1 2 4 header cols=+scoresums,-scoreavgs \
+                       --out "${chr_prefix}_chr${chr}" \
+                       --threads 1 \
+                       --memory 4000 \
+                       > /dev/null 2>&1
 
-                [ -f "${chr_prefix}_chr${chr}.profile" ] && any_scored=1
+                [ -f "${chr_prefix}_chr${chr}.sscore" ] && any_scored=1
             done
 
             if [ "$any_scored" -eq 1 ]; then
-                # Sum SCORESUM across chromosomes per individual
-                # .profile cols: FID IID PHENO CNT CNT2 SCORESUM
-                awk 'FNR==1{next}
-                     {key=$1"\t"$2"\t"$3; cnt[key]+=$5; score[key]+=$6}
-                     END{print "FID\tIID\tPHENO\tCNT\tCNT2\tSCORESUM";
-                         for(k in cnt) print k"\t"cnt[k]"\t"cnt[k]"\t"score[k]}' \
-                    "${chr_prefix}"_chr*.profile > "$scorefile"
+                # Sum SCORE1_SUM across chromosomes per individual
+                # plink2 .sscore cols: #FID IID ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_SUM
+                awk 'FNR==1 && NR==FNR{print; next} FNR==1{next}
+                     {key=$1"\t"$2; act[key]+=$3; dos[key]+=$4; score[key]+=$5}
+                     END{for(k in score) print k"\t"act[k]"\t"dos[k]"\t"score[k]}' \
+                    OFS='\t' "${chr_prefix}"_chr*.sscore > "$scorefile"
                 chmod a-w "$scorefile"
             else
                 echo "[$(date '+%F %T')] SCORE ${idp}/${cohort} ... FAIL (no chr scored)"
             fi
 
             # Cleanup per-chr intermediates
-            rm -f "${chr_prefix}"_chr*.{profile,log,nosex,nopred}
+            rm -f "${chr_prefix}"_chr*.{sscore,log}
         done
 
         # Cleanup chr:pos intermediates

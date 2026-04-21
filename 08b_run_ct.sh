@@ -80,7 +80,7 @@ mkdir -p "$CLUMP_DIR" "$LOG_DIR" "$SCRATCH"
 
 # ── Pre-filter: extract EUR SNP list + rsID→chr:pos map (once) ────────────────
 EUR_SNPS="${OUT_BASE}/.eur_snps.txt"
-RSID_MAP="${OUT_BASE}/.rsid_to_chrpos_refalt.txt"
+RSID_MAP="${OUT_BASE}/.rsid_to_chrpos.txt"
 if [ ! -f "$EUR_SNPS" ]; then
     awk '{print $2}' "${EUR_REF}.bim" > "${EUR_SNPS}.tmp"
     mv "${EUR_SNPS}.tmp" "$EUR_SNPS"
@@ -88,9 +88,9 @@ if [ ! -f "$EUR_SNPS" ]; then
 fi
 if [ ! -f "$RSID_MAP" ]; then
     # chr:pos:ref:alt — unique even for multiallelic sites
-    awk '{OFS="\t"; print $2, $1":"$4":"$6":"$5}' "${EUR_REF}.bim" > "${RSID_MAP}.tmp"
+    awk '{OFS="\t"; print $2, $1":"$4}' "${EUR_REF}.bim" > "${RSID_MAP}.tmp"
     mv "${RSID_MAP}.tmp" "$RSID_MAP"
-    echo "[$(date '+%F %T')] rsID-to-chr:pos:ref:alt map: $(wc -l < "$RSID_MAP") entries"
+    echo "[$(date '+%F %T')] rsID-to-chr:pos map: $(wc -l < "$RSID_MAP") entries"
 fi
 
 # ── Worker function ──────────────────────────────────────────────────────────
@@ -197,7 +197,8 @@ process_idp() {
                 [ ! -f "$vcf" ] && continue
 
                 plink2 --vcf "$vcf" dosage=DS \
-                       --set-all-var-ids @:#:\$r:\$a \
+                       --set-all-var-ids @:# \
+                       --rm-dup force-first \
                        --extract "$chrpos_snps" \
                        --score "$chrpos_sst" 1 2 4 header cols=+scoresums,-scoreavgs \
                        --out "${chr_prefix}_chr${chr}" \

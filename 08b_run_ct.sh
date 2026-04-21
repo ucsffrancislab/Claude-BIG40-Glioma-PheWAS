@@ -6,14 +6,13 @@
 # then score all 4 cohorts. Minutes per IDP instead of hours.
 #
 # Usage:
-#   sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [end_idp]
+#   sbatch 08b_run_ct.sh <out_base> [start_idp] [end_idp]
 #
 # Examples:
-#   sbatch 08b_run_ct.sh /path/to/input /francislab/data1/working/BIG40/ct_output
-#   sbatch 08b_run_ct.sh /path/to/input /path/to/ct_output 1 2126
+#   sbatch 08b_run_ct.sh ${PWD}/ct_output
+#   sbatch 08b_run_ct.sh ${PWD}/ct_output 1 2126
 #
-# <input_dir> contains the target genotype plink filesets:
-#   imputed-umich-{cidr,i370,onco,tcga}.{bed,bim,fam}
+# Requires 08b_prep_target.sh to have been run first (creates target_bed/).
 #
 # Crash / timeout recovery:
 #   - Score files are chmod a-w on success
@@ -34,16 +33,15 @@
 set -eu
 
 # ── CLI arguments ────────────────────────────────────────────────────────────
-INPUT_DIR="${1:?Usage: sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [end_idp]}"
-OUT_BASE="${2:?Usage: sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [end_idp]}"
+OUT_BASE="${1:?Usage: sbatch 08b_run_ct.sh <out_base> [start_idp] [end_idp]}"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 EUR_REF="/francislab/data1/refs/sources/fileserve.mrcieu.ac.uk/ld/EUR"
 SST_DIR="/francislab/data1/refs/BIG40/prscs_input"
 COHORTS="cidr i370 onco tcga"
 N_GWAS=33224
-START_IDP="${3:-${START_IDP:-1}}"
-END_IDP="${4:-${END_IDP:-3935}}"
+START_IDP="${2:-${START_IDP:-1}}"
+END_IDP="${3:-${END_IDP:-3935}}"
 N_WORKERS="${SLURM_CPUS_PER_TASK:-32}"
 
 # C+T parameters
@@ -62,8 +60,9 @@ if [ ! -f "${EUR_REF}.bed" ]; then
     exit 1
 fi
 for cohort in $COHORTS; do
-    if [ ! -f "${INPUT_DIR}/imputed-umich-${cohort}/chr1.dose.vcf.gz" ]; then
-        echo "ERROR: VCF not found: ${INPUT_DIR}/imputed-umich-${cohort}/chr1.dose.vcf.gz" >&2
+    if [ ! -f "${OUT_BASE}/target_bed/${cohort}.bed" ]; then
+        echo "ERROR: target binary not found: ${OUT_BASE}/target_bed/${cohort}.bed" >&2
+        echo "       Run 08b_prep_target.sh first." >&2
         exit 1
     fi
 done
@@ -71,6 +70,7 @@ done
 # ── Directory setup ──────────────────────────────────────────────────────────
 CLUMP_DIR="${OUT_BASE}/clumped"
 SCORE_DIR="${OUT_BASE}/scores"
+TARGET_DIR="${OUT_BASE}/target_bed"
 LOG_DIR="${OUT_BASE}/logs/${SLURM_JOB_ID:-local}"
 SCRATCH="${TMPDIR:-/tmp}/ct_$$"
 for cohort in $COHORTS; do
@@ -181,7 +181,7 @@ process_idp() {
         n_chrpos=$(wc -l < "$chrpos_snps")
         echo "[$(date '+%F %T')] CHRPOS ${idp} ... ${n_chrpos} SNPs translated"
 
-        # ── Score each cohort (per-chr VCFs, then sum) ───────────────────
+        # ── Score each cohort (single plink2 call from pre-extracted binary) ─
         for cohort in $COHORTS; do
             local scorefile="${SCORE_DIR}/${cohort}/${idp}.profile"
             if [ -f "$scorefile" ] && [ ! -w "$scorefile" ]; then
@@ -189,41 +189,21 @@ process_idp() {
             fi
             [ -f "$scorefile" ] && rm -f "$scorefile"
 
-            local chr_prefix="${SCRATCH}/${idp}_${cohort}"
-            local any_scored=0
+            plink2 --bfile "${TARGET_DIR}/${cohort}" \
+                   --extract "$chrpos_snps" \
+                   --score "$chrpos_sst" 1 2 4 header cols=+scoresums,-scoreavgs \
+                   --out "${SCRATCH}/${idp}_${cohort}" \
+                   --threads 1 \
+                   --memory 4000 \
+                   > /dev/null 2>&1
 
-            for chr in $(seq 1 22); do
-                local vcf="${INPUT_DIR}/imputed-umich-${cohort}/chr${chr}.dose.vcf.gz"
-                [ ! -f "$vcf" ] && continue
-
-                plink2 --vcf "$vcf" dosage=DS \
-                       --set-all-var-ids @:# \
-                       --rm-dup force-first \
-                       --extract "$chrpos_snps" \
-                       --score "$chrpos_sst" 1 2 4 header cols=+scoresums,-scoreavgs \
-                       --out "${chr_prefix}_chr${chr}" \
-                       --threads 1 \
-                       --memory 4000 \
-                       > /dev/null 2>&1
-
-                [ -f "${chr_prefix}_chr${chr}.sscore" ] && any_scored=1
-            done
-
-            if [ "$any_scored" -eq 1 ]; then
-                # Sum SCORE1_SUM across chromosomes per individual
-                # plink2 .sscore cols: #FID IID ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_SUM
-                # plink2 VCF .sscore cols: #IID ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_SUM
-                awk 'FNR==1 && NR==FNR{print; next} FNR==1{next}
-                     {iid=$1; act[iid]+=$2; dos[iid]+=$3; score[iid]+=$4}
-                     END{for(k in score) print k"\t"act[k]"\t"dos[k]"\t"score[k]}' \
-                    OFS='\t' "${chr_prefix}"_chr*.sscore > "$scorefile"
+            if [ -f "${SCRATCH}/${idp}_${cohort}.sscore" ]; then
+                mv "${SCRATCH}/${idp}_${cohort}.sscore" "$scorefile"
                 chmod a-w "$scorefile"
             else
-                echo "[$(date '+%F %T')] SCORE ${idp}/${cohort} ... FAIL (no chr scored)"
+                echo "[$(date '+%F %T')] SCORE ${idp}/${cohort} ... FAIL"
             fi
-
-            # Cleanup per-chr intermediates
-            rm -f "${chr_prefix}"_chr*.{sscore,log}
+            rm -f "${SCRATCH}/${idp}_${cohort}".log
         done
 
         # Cleanup chr:pos intermediates
@@ -242,7 +222,7 @@ process_idp() {
 export -f process_idp
 
 # Export everything workers need
-export COHORTS SST_DIR INPUT_DIR CLUMP_DIR SCORE_DIR LOG_DIR SCRATCH
+export COHORTS SST_DIR CLUMP_DIR SCORE_DIR TARGET_DIR LOG_DIR SCRATCH
 export EUR_REF EUR_SNPS RSID_MAP N_GWAS
 export CLUMP_P1 CLUMP_R2 CLUMP_KB
 

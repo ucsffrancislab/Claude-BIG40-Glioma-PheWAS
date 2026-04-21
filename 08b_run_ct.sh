@@ -40,7 +40,6 @@ OUT_BASE="${2:?Usage: sbatch 08b_run_ct.sh <input_dir> <out_base> [start_idp] [e
 # ── Configuration ────────────────────────────────────────────────────────────
 EUR_REF="/francislab/data1/refs/sources/fileserve.mrcieu.ac.uk/ld/EUR"
 SST_DIR="/francislab/data1/refs/BIG40/prscs_input"
-BIM_DIR="/francislab/data1/refs/BIG40/target_bim"
 COHORTS="cidr i370 onco tcga"
 N_GWAS=33224
 START_IDP="${3:-${START_IDP:-1}}"
@@ -61,12 +60,8 @@ if [ ! -f "${EUR_REF}.bed" ]; then
     exit 1
 fi
 for cohort in $COHORTS; do
-    if [ ! -f "${INPUT_DIR}/imputed-umich-${cohort}.bed" ]; then
-        echo "ERROR: target genotypes not found: ${INPUT_DIR}/imputed-umich-${cohort}.bed" >&2
-        exit 1
-    fi
-    if [ ! -f "${BIM_DIR}/${cohort}.bim" ]; then
-        echo "ERROR: remapped BIM not found: ${BIM_DIR}/${cohort}.bim" >&2
+    if [ ! -f "${INPUT_DIR}/imputed-umich-${cohort}/chr1.dose.vcf.gz" ]; then
+        echo "ERROR: VCF not found: ${INPUT_DIR}/imputed-umich-${cohort}/chr1.dose.vcf.gz" >&2
         exit 1
     fi
 done
@@ -81,12 +76,18 @@ for cohort in $COHORTS; do
 done
 mkdir -p "$CLUMP_DIR" "$LOG_DIR" "$SCRATCH"
 
-# ── Pre-filter: extract EUR SNP list (once, speeds up all clumping) ──────────
+# ── Pre-filter: extract EUR SNP list + rsID→chr:pos map (once) ────────────────
 EUR_SNPS="${OUT_BASE}/.eur_snps.txt"
+RSID_MAP="${OUT_BASE}/.rsid_to_chrpos.txt"
 if [ ! -f "$EUR_SNPS" ]; then
     awk '{print $2}' "${EUR_REF}.bim" > "${EUR_SNPS}.tmp"
     mv "${EUR_SNPS}.tmp" "$EUR_SNPS"
     echo "[$(date '+%F %T')] EUR SNP list: $(wc -l < "$EUR_SNPS") SNPs"
+fi
+if [ ! -f "$RSID_MAP" ]; then
+    awk '{OFS="\t"; print $2, $1":"$4}' "${EUR_REF}.bim" > "${RSID_MAP}.tmp"
+    mv "${RSID_MAP}.tmp" "$RSID_MAP"
+    echo "[$(date '+%F %T')] rsID-to-chr:pos map: $(wc -l < "$RSID_MAP") entries"
 fi
 
 # ── Worker function ──────────────────────────────────────────────────────────
@@ -160,33 +161,68 @@ process_idp() {
             rm -f "$sst_filt" "${SCRATCH}/${idp}".{clumped,log,nosex}
         fi
 
-        # ── Score each cohort ────────────────────────────────────────────
+        # ── Build chr:pos score file from clumped rsIDs ────────────────────
+        local chrpos_snps="${SCRATCH}/${idp}_chrpos.snps"
+        local chrpos_sst="${SCRATCH}/${idp}_chrpos.txt"
+
+        # Translate clumped rsIDs to chr:pos
+        awk 'NR==FNR{map[$1]=$2; next} ($1 in map){print map[$1]}' \
+            "$RSID_MAP" "$clump_snps" > "$chrpos_snps"
+
+        # Create chr:pos version of sumstats (header preserved, rsIDs replaced)
+        awk -F'\t' -v OFS='\t' \
+            'NR==FNR{map[$1]=$2; next} FNR==1{print; next} ($1 in map){$1=map[$1]; print}' \
+            "$RSID_MAP" "$sst_file" > "$chrpos_sst"
+
+        local n_chrpos
+        n_chrpos=$(wc -l < "$chrpos_snps")
+        echo "[$(date '+%F %T')] CHRPOS ${idp} ... ${n_chrpos} SNPs translated"
+
+        # ── Score each cohort (per-chr VCFs, then sum) ───────────────────
         for cohort in $COHORTS; do
             local scorefile="${SCORE_DIR}/${cohort}/${idp}.profile"
             if [ -f "$scorefile" ] && [ ! -w "$scorefile" ]; then
                 continue    # already done
             fi
-            # Remove stale partial
             [ -f "$scorefile" ] && rm -f "$scorefile"
 
-            plink --bed "${INPUT_DIR}/imputed-umich-${cohort}.bed" \
-                  --bim "${BIM_DIR}/${cohort}.bim" \
-                  --fam "${INPUT_DIR}/imputed-umich-${cohort}.fam" \
-                  --extract "$clump_snps" \
-                  --score "$sst_file" 1 2 4 header \
-                  --out "${SCORE_DIR}/${cohort}/${idp}" \
-                  --threads 1 \
-                  --memory 4000 \
-                  > /dev/null 2>&1
+            local chr_prefix="${SCRATCH}/${idp}_${cohort}"
+            local any_scored=0
 
-            if [ -f "$scorefile" ]; then
+            for chr in $(seq 1 22); do
+                local vcf="${INPUT_DIR}/imputed-umich-${cohort}/chr${chr}.dose.vcf.gz"
+                [ ! -f "$vcf" ] && continue
+
+                plink --vcf "$vcf" \
+                      --extract "$chrpos_snps" \
+                      --score "$chrpos_sst" 1 2 4 header sum \
+                      --out "${chr_prefix}_chr${chr}" \
+                      --threads 1 \
+                      --memory 4000 \
+                      > /dev/null 2>&1
+
+                [ -f "${chr_prefix}_chr${chr}.profile" ] && any_scored=1
+            done
+
+            if [ "$any_scored" -eq 1 ]; then
+                # Sum SCORESUM across chromosomes per individual
+                # .profile cols: FID IID PHENO CNT CNT2 SCORESUM
+                awk 'FNR==1{next}
+                     {key=$1"\t"$2"\t"$3; cnt[key]+=$5; score[key]+=$6}
+                     END{print "FID\tIID\tPHENO\tCNT\tCNT2\tSCORESUM";
+                         for(k in cnt) print k"\t"cnt[k]"\t"cnt[k]"\t"score[k]}' \
+                    "${chr_prefix}"_chr*.profile > "$scorefile"
                 chmod a-w "$scorefile"
             else
-                echo "[$(date '+%F %T')] SCORE ${idp}/${cohort} ... FAIL"
+                echo "[$(date '+%F %T')] SCORE ${idp}/${cohort} ... FAIL (no chr scored)"
             fi
-            # Clean up plink side files
-            rm -f "${SCORE_DIR}/${cohort}/${idp}".{log,nosex,nopred}
+
+            # Cleanup per-chr intermediates
+            rm -f "${chr_prefix}"_chr*.{profile,log,nosex,nopred}
         done
+
+        # Cleanup chr:pos intermediates
+        rm -f "$chrpos_snps" "$chrpos_sst"
 
         # ── Cleanup scratch ──────────────────────────────────────────────
         [ "$sst_file" = "${SCRATCH}/${idp}.txt" ] && rm -f "$sst_file"
@@ -201,8 +237,8 @@ process_idp() {
 export -f process_idp
 
 # Export everything workers need
-export COHORTS SST_DIR INPUT_DIR BIM_DIR CLUMP_DIR SCORE_DIR LOG_DIR SCRATCH
-export EUR_REF EUR_SNPS N_GWAS
+export COHORTS SST_DIR INPUT_DIR CLUMP_DIR SCORE_DIR LOG_DIR SCRATCH
+export EUR_REF EUR_SNPS RSID_MAP N_GWAS
 export CLUMP_P1 CLUMP_R2 CLUMP_KB
 
 # ── Master heartbeat ─────────────────────────────────────────────────────────

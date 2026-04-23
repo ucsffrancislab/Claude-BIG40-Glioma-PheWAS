@@ -36,10 +36,17 @@
 set -eu
 
 # ── CLI arguments ────────────────────────────────────────────────────────────
-OUT_BASE="${1:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]}"
-COHORT_RAW="${2:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]}"
-START_IDP="${3:-1}"
-END_IDP="${4:-3935}"
+OUT_BASE="${1:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]  OR  <out_base> <cohort> <idp_list_file>}"
+COHORT_RAW="${2:?}"
+# Accept either (start end) range or a file of IDP numbers
+if [ -f "${3:-}" ]; then
+    IDP_LIST_FILE="$3"
+    echo "[$(date '+%F %T')] IDP list file: $IDP_LIST_FILE ($(wc -l < "$IDP_LIST_FILE") IDPs)"
+else
+    START_IDP="${3:-1}"
+    END_IDP="${4:-3935}"
+    IDP_LIST_FILE=""
+fi
 
 COHORT="${COHORT_RAW#imputed-umich-}"
 
@@ -52,6 +59,10 @@ N_GWAS=33224
 
 # Number of parallel workers (edit here to change; --export=None blocks env overrides)
 N_WORKERS="${SLURM_CPUS_PER_TASK:-32}"
+
+# MCMC iterations (default 500/250 for screening; use 1000/500 for final)
+N_ITER="${N_ITER:-500}"
+N_BURNIN="${N_BURNIN:-250}"
 
 # Locate BIM (with or without imputed-umich- prefix)
 if   [ -f "${BIM_DIR}/${COHORT}.bim" ];                 then BIM_PREFIX="${BIM_DIR}/${COHORT}"
@@ -97,7 +108,7 @@ export PYTHONUNBUFFERED=1
 
 # Export everything worker subshells need
 export COHORT BIM_PREFIX PRSCS_PY LD_REF SST_DIR COHORT_OUT LOCK_DIR
-export WORKER_LOG_DIR N_GWAS
+export WORKER_LOG_DIR N_GWAS N_ITER N_BURNIN
 
 # ── Worker function ──────────────────────────────────────────────────────────
 # One call = one IDP. All 22 chrs in a single python invocation (only missing
@@ -164,6 +175,8 @@ process_idp() {
                 --bim_prefix="$BIM_PREFIX" \
                 --sst_file="$sst_file" \
                 --n_gwas="$N_GWAS" \
+                --n_iter="$N_ITER" \
+                --n_burnin="$N_BURNIN" \
                 --chrom="$chrom_arg" \
                 --out_dir="${idp_out_dir}/${idp}" \
                 || prscs_rc=$?
@@ -218,13 +231,23 @@ HEARTBEAT_PID=$!
 trap 'kill $HEARTBEAT_PID 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
 # ── Dispatch IDPs to worker pool ─────────────────────────────────────────────
-echo "[$(date '+%F %T')] START cohort=${COHORT}  idps=${START_IDP}..${END_IDP}  workers=${N_WORKERS}"
+if [ -n "$IDP_LIST_FILE" ]; then
+    n_idps=$(wc -l < "$IDP_LIST_FILE")
+    echo "[$(date '+%F %T')] START cohort=${COHORT}  idps=${n_idps} from list  workers=${N_WORKERS}"
+else
+    n_idps=$(( END_IDP - START_IDP + 1 ))
+    echo "[$(date '+%F %T')] START cohort=${COHORT}  idps=${START_IDP}..${END_IDP}  workers=${N_WORKERS}"
+fi
 echo "[$(date '+%F %T')]   out=${COHORT_OUT}"
 echo "[$(date '+%F %T')]   worker_logs=${WORKER_LOG_DIR}"
 
-seq -f "%04.0f" "$START_IDP" "$END_IDP" |
-    xargs -P "$N_WORKERS" -I '{}' bash -c 'process_idp "$1"' _ '{}'
+if [ -n "$IDP_LIST_FILE" ]; then
+    cat "$IDP_LIST_FILE" | xargs -P "$N_WORKERS" -I '{}' bash -c 'process_idp "$1"' _ '{}'
+else
+    seq -f "%04.0f" "$START_IDP" "$END_IDP" |
+        xargs -P "$N_WORKERS" -I '{}' bash -c 'process_idp "$1"' _ '{}'
+fi
 
 # ── Final verify ─────────────────────────────────────────────────────────────
 n_complete=$(find "$COHORT_OUT" -name '*_pst_eff_*_chr22.txt' ! -writable 2>/dev/null | wc -l)
-echo "[$(date '+%F %T')] FINISH cohort=${COHORT}  fully_complete=${n_complete}/$((END_IDP - START_IDP + 1))"
+echo "[$(date '+%F %T')] FINISH cohort=${COHORT}  fully_complete=${n_complete}/${n_idps}"

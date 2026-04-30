@@ -10,8 +10,10 @@
 #   sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]
 #
 # Examples:
-#   sbatch 08_run_prscs.sh /francislab/data1/working/BIG40/prscs_output cidr
-#   sbatch 08_run_prscs.sh /francislab/data1/working/BIG40/prscs_output i370 1 2000
+#   sbatch ... 08_run_prscs.sh ${PWD}/prscs_output cidr ${PWD}/prscs_idp_list.txt
+#   sbatch ... 08_run_prscs.sh ${PWD}/prscs_output cidr ${PWD}/prscs_idp_list.txt 1000 500
+#   sbatch ... 08_run_prscs.sh ${PWD}/prscs_output cidr 1 2126
+#   sbatch ... 08_run_prscs.sh ${PWD}/prscs_output cidr 1 2126 1000 500
 #
 # Crash / timeout recovery:
 #   - Output files chmod a-w on successful completion
@@ -36,15 +38,19 @@
 set -eu
 
 # ── CLI arguments ────────────────────────────────────────────────────────────
-OUT_BASE="${1:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [start_idp] [end_idp]  OR  <out_base> <cohort> <idp_list_file>}"
+OUT_BASE="${1:?Usage: sbatch 08_run_prscs.sh <out_base> <cohort> [idp_list_or_start] [end_idp] [n_iter] [n_burnin]}"
 COHORT_RAW="${2:?}"
 # Accept either (start end) range or a file of IDP numbers
 if [ -f "${3:-}" ]; then
     IDP_LIST_FILE="$3"
+    N_ITER="${4:-500}"
+    N_BURNIN="${5:-250}"
     echo "[$(date '+%F %T')] IDP list file: $IDP_LIST_FILE ($(wc -l < "$IDP_LIST_FILE") IDPs)"
 else
     START_IDP="${3:-1}"
     END_IDP="${4:-3935}"
+    N_ITER="${5:-500}"
+    N_BURNIN="${6:-250}"
     IDP_LIST_FILE=""
 fi
 
@@ -60,9 +66,8 @@ N_GWAS=33224
 # Number of parallel workers (edit here to change; --export=None blocks env overrides)
 N_WORKERS="${SLURM_CPUS_PER_TASK:-32}"
 
-# MCMC iterations (default 500/250 for screening; use 1000/500 for final)
-N_ITER="${N_ITER:-500}"
-N_BURNIN="${N_BURNIN:-250}"
+# MCMC iterations (set via CLI args; defaults: 500/250 for screening)
+# For final analysis, pass 1000 and 500 as additional arguments
 
 # Locate BIM (with or without imputed-umich- prefix)
 if   [ -f "${BIM_DIR}/${COHORT}.bim" ];                 then BIM_PREFIX="${BIM_DIR}/${COHORT}"
@@ -239,6 +244,7 @@ else
     echo "[$(date '+%F %T')] START cohort=${COHORT}  idps=${START_IDP}..${END_IDP}  workers=${N_WORKERS}"
 fi
 echo "[$(date '+%F %T')]   out=${COHORT_OUT}"
+echo "[$(date '+%F %T')]   mcmc: n_iter=${N_ITER}, n_burnin=${N_BURNIN}"
 echo "[$(date '+%F %T')]   worker_logs=${WORKER_LOG_DIR}"
 
 if [ -n "$IDP_LIST_FILE" ]; then

@@ -191,22 +191,34 @@ meta <- results[, {
 cat(sprintf("[%s] Computing M_eff (eigenvalue-based correction) ...\n", Sys.time()))
 
 # Build PGS matrix: rows = individuals, cols = IDPs
-# Use the first outcome (all_glioma) scores for correlation
-pgs_matrix <- NULL
-for (cohort in names(cov_list)) {
-    for (idp in idp_ids) {
-        sf <- file.path(SCORE_DIR, cohort, paste0(idp, score_ext))
-        if (!file.exists(sf)) next
-        sc <- tryCatch(fread(sf, select = c(ncol(fread(sf, nrows = 0)))), error = function(e) NULL)
-        if (is.null(sc)) next
-        setnames(sc, 1, idp)
-        if (is.null(pgs_matrix)) {
-            pgs_matrix <- sc
-        } else {
-            pgs_matrix <- cbind(pgs_matrix, sc)
-        }
-        break  # one cohort is enough for correlation structure
+# Use the largest cohort for the best correlation estimate
+largest_cohort <- names(which.max(sapply(cov_list, nrow)))
+cat(sprintf("  Using %s (%d samples) for PGS correlation matrix\n",
+    largest_cohort, nrow(cov_list[[largest_cohort]])))
+
+pgs_wide <- NULL
+for (idp in idp_ids) {
+    sf <- file.path(SCORE_DIR, largest_cohort, paste0(idp, score_ext))
+    if (!file.exists(sf)) next
+    sc <- tryCatch(fread(sf), error = function(e) NULL)
+    if (is.null(sc) || nrow(sc) == 0) next
+    # Get IID and last column (score)
+    nms <- names(sc)
+    if ("#FID" %in% nms) setnames(sc, "#FID", "FID", skip_absent = TRUE)
+    if ("#IID" %in% nms) setnames(sc, "#IID", "IID")
+    score_col <- nms[length(nms)]
+    sc_slim <- sc[, .(IID = get("IID"), score = as.numeric(get(score_col)))]
+    setnames(sc_slim, "score", idp)
+    if (is.null(pgs_wide)) {
+        pgs_wide <- sc_slim
+    } else {
+        pgs_wide <- merge(pgs_wide, sc_slim, by = "IID", all = TRUE)
     }
+}
+if (!is.null(pgs_wide)) {
+    pgs_matrix <- as.matrix(pgs_wide[, -"IID", with = FALSE])
+} else {
+    pgs_matrix <- NULL
 }
 
 if (!is.null(pgs_matrix) && ncol(pgs_matrix) > 1) {
@@ -312,9 +324,14 @@ for (oc_label in unique(meta$outcome)) {
     sub[, cat_idx := as.integer(factor(category, levels = cats))]
     sub[, cat_color := ifelse(cat_idx %% 2 == 0, "A", "B")]
     
-    p <- ggplot(sub, aes(x = seq_len(.N), y = neglogp, color = cat_color)) +
-        geom_point(size = ifelse(sub$sig_meff, 3, 0.8),
-                   alpha = ifelse(sub$neglogp > -log10(0.05), 0.8, 0.3)) +
+    sub[, pt_size := fifelse(sig_meff, 3, 0.8)]
+    sub[, pt_alpha := fifelse(neglogp > -log10(0.05), 0.8, 0.3)]
+    sub[, x_pos := .I]
+    
+    p <- ggplot(sub, aes(x = x_pos, y = neglogp, color = cat_color)) +
+        geom_point(aes(size = pt_size, alpha = pt_alpha)) +
+        scale_size_identity() +
+        scale_alpha_identity() +
         geom_hline(yintercept = -log10(alpha_eff), linetype = "solid", color = "red", linewidth = 0.5) +
         geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50", linewidth = 0.3) +
         scale_color_manual(values = c("A" = "#1f77b4", "B" = "#ff7f0e"), guide = "none") +
@@ -324,13 +341,15 @@ for (oc_label in unique(meta$outcome)) {
         theme_minimal() +
         theme(axis.text.x = element_blank())
     
-    # Label significant points
+    # Label significant points (or top 10 if none significant)
     sig_sub <- sub[sig_meff == TRUE]
-    if (nrow(sig_sub) > 0) {
+    if (nrow(sig_sub) == 0) sig_sub <- sub[order(-neglogp)][1:min(10, .N)]
+    if (nrow(sig_sub) > 0 && requireNamespace("ggrepel", quietly = TRUE)) {
         p <- p + ggrepel::geom_text_repel(
             data = sig_sub,
-            aes(label = idp_short_name),
-            size = 2.5, max.overlaps = 20, color = "black"
+            aes(x = x_pos, label = idp_short_name),
+            size = 2.5, max.overlaps = 20, color = "black",
+            inherit.aes = FALSE
         )
     }
     

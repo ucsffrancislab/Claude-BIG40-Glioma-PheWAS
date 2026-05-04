@@ -96,7 +96,11 @@ for (mf in meta_files) {
 run_association <- function(idp, cohort, outcome) {
     sf <- file.path(SCORE_DIR, cohort, paste0(idp, score_ext))
     if (!file.exists(sf)) return(NULL)
-    scores <- tryCatch(fread(sf, comment.char = ""), error = function(e) NULL)
+    scores <- tryCatch({
+        dt <- fread(sf)
+        setnames(dt, names(dt), sub("^#", "", names(dt)))
+        dt
+    }, error = function(e) NULL)
     if (is.null(scores) || nrow(scores) == 0) return(NULL)
 
     # Standardize column names
@@ -139,8 +143,8 @@ run_association <- function(idp, cohort, outcome) {
     covars <- c(covars, available_pcs)
 
     tryCatch({
-        fit <- glm(as.formula(paste("Y ~", paste(covars, collapse = "+"))),
-                    data = merged, family = binomial())
+        fit <- suppressWarnings(glm(as.formula(paste("Y ~", paste(covars, collapse = "+"))),
+                    data = merged, family = binomial()))
         coefs <- summary(fit)$coefficients
         if (!"PGS" %in% rownames(coefs)) return(NULL)
         ci <- confint.default(fit)["PGS", ]
@@ -152,7 +156,7 @@ run_association <- function(idp, cohort, outcome) {
             ci_lo = exp(ci[1]), ci_hi = exp(ci[2]),
             n_case = n_case, n_ctrl = n_ctrl
         )
-    }, error = function(e) NULL, warning = function(w) NULL)
+    }, error = function(e) NULL)
 }
 
 # ── Run all associations ─────────────────────────────────────────────────────
@@ -200,7 +204,11 @@ pgs_wide <- NULL
 for (idp in idp_ids) {
     sf <- file.path(SCORE_DIR, largest_cohort, paste0(idp, score_ext))
     if (!file.exists(sf)) next
-    sc <- tryCatch(fread(sf, comment.char = ""), error = function(e) NULL)
+    sc <- tryCatch({
+        dt <- fread(sf)
+        setnames(dt, names(dt), sub("^#", "", names(dt)))
+        dt
+    }, error = function(e) NULL)
     if (is.null(sc) || nrow(sc) == 0) next
     # Get IID and last column (score)
     nms <- names(sc)

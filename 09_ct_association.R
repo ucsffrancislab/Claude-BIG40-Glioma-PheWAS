@@ -91,7 +91,11 @@ run_association <- function(idp, cohort, outcome) {
     score_file <- file.path(score_dir, cohort, paste0(idp, ".profile"))
     if (!file.exists(score_file)) return(NULL)
 
-    scores <- tryCatch(fread(score_file, comment.char = ""), error = function(e) NULL)
+    scores <- tryCatch({
+        dt <- fread(score_file)
+        setnames(dt, names(dt), sub("^#", "", names(dt)))
+        dt
+    }, error = function(e) NULL)
     if (is.null(scores) || nrow(scores) == 0) return(NULL)
 
     # Standardize column names
@@ -150,7 +154,7 @@ run_association <- function(idp, cohort, outcome) {
 
     # Fit logistic regression
     result <- tryCatch({
-        fit <- glm(as.formula(formula_str), data = merged, family = binomial())
+        fit <- suppressWarnings(glm(as.formula(formula_str), data = merged, family = binomial()))
         coefs <- summary(fit)$coefficients
         if (!"PGS" %in% rownames(coefs)) return(NULL)
         data.table(
@@ -165,7 +169,7 @@ run_association <- function(idp, cohort, outcome) {
             n_ctrl   = n_ctrl,
             or       = exp(coefs["PGS", "Estimate"])
         )
-    }, error = function(e) NULL, warning = function(w) NULL)
+    }, error = function(e) NULL)
 
     result
 }

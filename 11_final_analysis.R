@@ -347,7 +347,7 @@ for (oc_label in unique(meta$outcome)) {
     if (nrow(sig_sub) > 0 && requireNamespace("ggrepel", quietly = TRUE)) {
         p <- p + ggrepel::geom_text_repel(
             data = sig_sub,
-            aes(x = x_pos, label = idp_short_name),
+            aes(x = x_pos, y = neglogp, label = idp_short_name),
             size = 2.5, max.overlaps = 20, color = "black",
             inherit.aes = FALSE
         )

@@ -144,7 +144,7 @@ score_idp() {
         [ -f "$sf" ] && rm -f "$sf"
 
         plink2 --bfile "${TARGET_DIR}/${cohort}" \
-               --score "$weight_file" 1 2 3 header-read cols=+scoresums,-scoreavgs \
+               --score "$weight_file" 1 2 3 cols=+scoresums,-scoreavgs \
                --out "${SCRATCH}/${idp}_${cohort}" \
                --threads 1 \
                --memory 4000 \

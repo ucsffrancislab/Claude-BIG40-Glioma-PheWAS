@@ -91,7 +91,7 @@ run_association <- function(idp, cohort, outcome) {
     score_file <- file.path(score_dir, cohort, paste0(idp, ".sscore"))
     if (!file.exists(score_file)) return(NULL)
 
-    scores <- tryCatch(fread(score_file), error = function(e) NULL)
+    scores <- tryCatch(fread(score_file, comment.char = ""), error = function(e) NULL)
     if (is.null(scores) || nrow(scores) == 0) return(NULL)
 
     # Standardize column names

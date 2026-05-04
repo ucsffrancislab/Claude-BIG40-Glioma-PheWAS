@@ -96,7 +96,7 @@ for (mf in meta_files) {
 run_association <- function(idp, cohort, outcome) {
     sf <- file.path(SCORE_DIR, cohort, paste0(idp, score_ext))
     if (!file.exists(sf)) return(NULL)
-    scores <- tryCatch(fread(sf), error = function(e) NULL)
+    scores <- tryCatch(fread(sf, comment.char = ""), error = function(e) NULL)
     if (is.null(scores) || nrow(scores) == 0) return(NULL)
 
     # Standardize column names
@@ -200,7 +200,7 @@ pgs_wide <- NULL
 for (idp in idp_ids) {
     sf <- file.path(SCORE_DIR, largest_cohort, paste0(idp, score_ext))
     if (!file.exists(sf)) next
-    sc <- tryCatch(fread(sf), error = function(e) NULL)
+    sc <- tryCatch(fread(sf, comment.char = ""), error = function(e) NULL)
     if (is.null(sc) || nrow(sc) == 0) next
     # Get IID and last column (score)
     nms <- names(sc)
